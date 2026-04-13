@@ -7,8 +7,9 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from packages.contracts.events import DashboardEventEnvelope
-from packages.contracts.topics import DASHBOARD_EVENTS_TOPIC
+from packages.contracts.events import DashboardControlEnvelope, DashboardEventEnvelope
+from packages.contracts.topics import DASHBOARD_CONTROL_TOPIC, DASHBOARD_EVENTS_TOPIC
+
 def _to_transport_value(value: Any) -> Any:
     if is_dataclass(value):
         return {key: _to_transport_value(item) for key, item in asdict(value).items()}
@@ -30,6 +31,26 @@ class CollectorPublisher:
 
     def __init__(self, broker: Any):
         self._broker = broker
+
+    async def publish_dashboard_control(
+        self,
+        *,
+        action: str,
+        owner_id: str,
+        symbol: str,
+        market: str,
+    ) -> dict[str, Any]:
+        message = _to_transport_value(
+            DashboardControlEnvelope(
+                action=action,
+                owner_id=owner_id,
+                symbol=symbol,
+                market=market.lower(),
+                requested_at=datetime.utcnow(),
+            )
+        )
+        await self._broker.publish(topic=DASHBOARD_CONTROL_TOPIC, value=message, key=owner_id)
+        return message
 
     async def publish_dashboard_event(
         self,

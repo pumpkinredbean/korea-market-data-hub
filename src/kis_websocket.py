@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timedelta
 from typing import Any, AsyncIterator
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -233,13 +235,54 @@ SCHEMA_BY_TR_ID = {
     },
 }
 
+KST = ZoneInfo("Asia/Seoul")
+DOMESTIC_REGULAR_SESSION_START = "090000"
+DOMESTIC_REGULAR_SESSION_END = "153000"
+
 
 class KISProgramTradeClient:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._active_ws: Any | None = None
+        self._access_token: str | None = None
+        self._access_token_expires_at: datetime | None = None
+        self._access_token_lock = threading.Lock()
+
+    def _is_access_token_valid(self) -> bool:
+        if not self._access_token:
+            return False
+        if self._access_token_expires_at is None:
+            return True
+        return datetime.utcnow() < (self._access_token_expires_at - timedelta(minutes=1))
+
+    @staticmethod
+    def _parse_access_token_expiry(body: dict[str, Any]) -> datetime | None:
+        expires_at_text = str(body.get("access_token_token_expired") or "").strip()
+        if expires_at_text:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    return datetime.strptime(expires_at_text, fmt)
+                except ValueError:
+                    continue
+
+        expires_in = body.get("expires_in")
+        try:
+            expires_in_seconds = int(expires_in)
+        except (TypeError, ValueError):
+            return None
+
+        if expires_in_seconds <= 0:
+            return None
+        return datetime.utcnow() + timedelta(seconds=expires_in_seconds)
 
     def get_access_token(self) -> str:
+        if self._is_access_token_valid():
+            return str(self._access_token)
+
+        with self._access_token_lock:
+            if self._is_access_token_valid():
+                return str(self._access_token)
+
         self.settings.require_kis_credentials()
         url = f"{self.settings.rest_url}/oauth2/tokenP"
         payload = {
@@ -254,12 +297,21 @@ class KISProgramTradeClient:
         }
 
         response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=15)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            try:
+                body = response.json()
+            except ValueError:
+                body = response.text
+            raise RuntimeError(f"KIS access token request failed: {body}") from exc
 
         body = response.json()
         access_token = body.get("access_token")
         if not access_token:
             raise RuntimeError(f"access_token 발급 실패: {body}")
+        self._access_token = str(access_token)
+        self._access_token_expires_at = self._parse_access_token_expiry(body)
         return access_token
 
     def get_approval_key(self) -> str:
@@ -369,7 +421,7 @@ class KISProgramTradeClient:
             "custtype": "P",
         }
 
-        current_time = "235959"
+        current_time = self._get_intraday_chart_anchor_time()
         rows: list[dict[str, Any]] = []
         seen_times: set[str] = set()
 
@@ -382,7 +434,14 @@ class KISProgramTradeClient:
                 "FID_PW_DATA_INCU_YN": "Y",
             }
             response = requests.get(url, headers=headers, params=params, timeout=15)
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                try:
+                    body = response.json()
+                except ValueError:
+                    body = response.text
+                raise RuntimeError(f"KIS intraday chart request failed: {body}") from exc
             body = response.json()
 
             if body.get("rt_cd") not in {None, "0"}:
@@ -411,6 +470,26 @@ class KISProgramTradeClient:
 
         rows.sort(key=lambda item: str(item.get("stck_cntg_hour") or ""))
         return rows
+
+    @staticmethod
+    def _get_intraday_chart_anchor_time(now: datetime | None = None) -> str:
+        """Return a practical KIS minute-chart cursor for domestic regular session rows.
+
+        KIS treats FID_INPUT_HOUR_1 as a real query-time cursor, so using a blanket
+        late-night value like 235959 can surface synthetic-looking late rows. This
+        first-pass policy keeps the collector on the regular-session minute chart
+        path by anchoring to the current KST time during the session and to the
+        regular-session close (15:30:00) outside the session.
+
+        This intentionally does not claim to solve after-hours/session-calendar
+        semantics in this step.
+        """
+
+        current = now.astimezone(KST) if now is not None else datetime.now(KST)
+        time_text = current.strftime("%H%M%S")
+        if DOMESTIC_REGULAR_SESSION_START <= time_text <= DOMESTIC_REGULAR_SESSION_END:
+            return time_text
+        return DOMESTIC_REGULAR_SESSION_END
 
     async def aclose(self) -> None:
         ws = self._active_ws

@@ -14,14 +14,16 @@ This repository is evolving into a reusable real-time market data stack for Kore
 ## High-level flow
 
 ```text
-broker adapter -> collector -> Kafka/Redpanda dashboard topic -> collector SSE -> api/web
+broker adapter -> collector -> Kafka/Redpanda dashboard topic -> api/web -> browser
+                    |                                          \
+                    |                                           -> collector control API (start/stop)
                     \
                      -> processor -> analytical storage
 ```
 
 Today, the repo already contains the monorepo skeleton for that shape:
 
-- `apps/collector`: FastAPI collector service that owns the live KIS upstream/runtime for current dashboard subscriptions and price-chart fetches
+- `apps/collector`: FastAPI collector service that owns the live KIS upstream/runtime, publishes dashboard events, exposes start/stop control endpoints, and relays price-chart fetches
 - `apps/processor`: placeholder service for downstream processing-stage wiring
 - `apps/api_web`: API and dashboard entrypoint
 - `packages/shared`: current shared config and minimal event helpers
@@ -31,13 +33,13 @@ Today, the repo already contains the monorepo skeleton for that shape:
 ## Current reality
 
 - KIS is the active adapter today
-- `collector` is a working dashboard ingress service with `/health` and `/stream`; `processor` is still a placeholder runtime
+- `collector` is the working dashboard ingress owner with `/health`, dashboard publication control endpoints, and `/api/price-chart`; `processor` is still a placeholder runtime
 - the repo already contains early broker-neutral scaffolding such as domain models and canonical event/topic packages
 - compose wiring already reflects the intended platform shape with collector, processor, Redpanda, ClickHouse, and API/web services
 - KRX-first dashboard live/runtime keeps collector as the only KIS upstream owner
 - the smallest Kafka-backed live slice uses one broker-neutral dashboard topic (`market.dashboard-events.v1`) as the broadcast core
-- collector publishes KIS-formatted dashboard events into that topic and serves SSE from broker-consumed events rather than direct in-memory-only fan-out
-- `api/web` does not own the live KIS runtime and does not connect to Kafka directly; for current active dashboard paths it relays collector SSE/HTTP to browsers
+- collector publishes KIS-formatted dashboard events into that topic and no longer consumes that same topic for browser delivery
+- `api/web` does not own the live KIS runtime; it requests collector start/stop for a symbol/market, consumes dashboard events directly from Kafka/Redpanda, and relays them to browsers over SSE
 - ClickHouse and richer processor stages remain outside this dashboard loop for now
 
 ## Design rules

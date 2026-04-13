@@ -4,7 +4,8 @@ import asyncio
 import contextlib
 import json
 import os
-import threading
+import uuid
+from datetime import datetime
 from textwrap import dedent
 from typing import Any
 
@@ -12,8 +13,16 @@ import requests
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from packages.contracts.topics import DASHBOARD_CONTROL_TOPIC, DASHBOARD_EVENTS_TOPIC
+from packages.infrastructure.kafka import AsyncKafkaJsonBroker
+from packages.shared.config import load_service_settings
+
 app = FastAPI(title="KIS Program Trade Realtime")
+service_settings = load_service_settings("api-web")
+dashboard_broker = AsyncKafkaJsonBroker(service_settings.bootstrap_servers)
 collector_base_url = os.getenv("COLLECTOR_BASE_URL", "http://127.0.0.1:8001").rstrip("/")
+
+
 def _serialize_sse_lines(lines: list[str]) -> str:
     return "".join(f"{line}\n" for line in lines)
 
@@ -27,6 +36,26 @@ def _collector_request(
         session.trust_env = False
         response = session.request(method, f"{collector_base_url}{path}", **kwargs)
         return response
+
+
+def _build_dashboard_group_id(*, symbol: str, market: str) -> str:
+    subscription_key = f"{market.lower()}-{symbol}"
+    return f"api-web-dashboard-{subscription_key}-{uuid.uuid4().hex}"
+
+
+async def _publish_dashboard_control(*, action: str, owner_id: str, symbol: str, market: str) -> None:
+    await dashboard_broker.publish(
+        topic=DASHBOARD_CONTROL_TOPIC,
+        key=owner_id,
+        value={
+            "action": action,
+            "owner_id": owner_id,
+            "symbol": symbol,
+            "market": market.lower(),
+            "requested_at": datetime.utcnow().isoformat(),
+            "schema_version": "v1",
+        },
+    )
 
 
 HTML = dedent(
@@ -90,8 +119,13 @@ HTML = dedent(
         button.secondary { background: rgba(51, 65, 85, 0.92); }
         .tick-toggle, .series-toggle { display: inline-flex; align-items: center; gap: 4px; padding: 3px; border: 1px solid rgba(148, 163, 184, 0.14); background: rgba(8, 15, 27, 0.82); }
         .tick-toggle-label { color: var(--muted); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; margin-right: 2px; }
-        .tick-btn, .series-btn, .price-mode-btn { min-width: 32px; padding: 5px 8px; font-size: 11px; background: transparent; border: 1px solid transparent; color: var(--muted); }
-        .tick-btn.active, .series-btn.active, .price-mode-btn.active { background: rgba(56, 189, 248, 0.14); border-color: rgba(56, 189, 248, 0.28); color: #e0f2fe; }
+        .tick-btn, .series-btn { min-width: 32px; padding: 5px 8px; font-size: 11px; background: transparent; border: 1px solid transparent; color: var(--muted); }
+        .tick-btn.active, .series-btn.active { background: rgba(56, 189, 248, 0.14); border-color: rgba(56, 189, 248, 0.28); color: #e0f2fe; }
+        .price-mode-menu { display: inline-flex; align-items: stretch; gap: 8px; padding: 6px 8px; border: 1px solid rgba(148, 163, 184, 0.14); background: rgba(8, 15, 27, 0.82); }
+        .price-mode-group { display: flex; flex-direction: column; gap: 4px; min-width: 92px; }
+        .price-mode-group-label { color: var(--muted); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; }
+        .price-mode-select { min-width: 92px; padding: 6px 8px; font-size: 12px; background: rgba(9, 17, 29, 0.96); border: 1px solid rgba(56, 189, 248, 0.18); color: var(--text); }
+        .price-mode-select.active { border-color: rgba(56, 189, 248, 0.38); box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.12); }
         .chart-canvas { width: 100%; flex: 1; min-height: 0; height: 100%; }
         .orderbook-shell { margin: 0 -8px -8px; padding: 0; background: transparent; border: none; display: flex; flex-direction: column; flex: 1; min-height: 0; }
         .orderbook-scroll { flex: 1; min-height: 0; overflow: auto; }
@@ -152,7 +186,7 @@ HTML = dedent(
           <select id="market">
             <option value="krx">KRX</option>
             <option value="nxt">NXT</option>
-            <option value="total">TOTAL</option>
+            <option value="total" selected>TOTAL</option>
           </select>
           <button id="saveDefaultLayoutBtn" class="secondary">현재 배치를 기본값으로 저장</button>
           <button id="resetLayoutBtn" class="secondary">기본 레이아웃 복원</button>
@@ -191,20 +225,31 @@ HTML = dedent(
               </div>
               <div class="widget-body">
                 <div class="panel-header">
-                  <div class="chart-header-tools">
-                    <div class="tick-toggle" aria-label="가격 차트 모드 선택">
-                      <span class="tick-toggle-label">모드</span>
-                      <button class="price-mode-btn active" data-price-mode="tick-1">1틱</button>
-                      <button class="price-mode-btn" data-price-mode="tick-5">5틱</button>
-                      <button class="price-mode-btn" data-price-mode="tick-10">10틱</button>
-                      <button class="price-mode-btn" data-price-mode="tick-30">30틱</button>
-                      <button class="price-mode-btn" data-price-mode="minute-10">10분</button>
-                      <button class="price-mode-btn" data-price-mode="minute-30">30분</button>
-                      <button class="price-mode-btn" data-price-mode="minute-60">60분</button>
+                    <div class="chart-header-tools">
+                    <div class="price-mode-menu" aria-label="가격 차트 모드 선택">
+                      <div class="price-mode-group">
+                        <label class="price-mode-group-label" for="tickModeSelect">틱 모드</label>
+                        <select id="tickModeSelect" class="price-mode-select active">
+                          <option value="tick-1" selected>1틱</option>
+                          <option value="tick-5">5틱</option>
+                          <option value="tick-10">10틱</option>
+                          <option value="tick-30">30틱</option>
+                        </select>
+                      </div>
+                      <div class="price-mode-group">
+                        <label class="price-mode-group-label" for="minuteModeSelect">분 모드</label>
+                        <select id="minuteModeSelect" class="price-mode-select">
+                          <option value="minute-1">1분</option>
+                          <option value="minute-5">5분</option>
+                          <option value="minute-10">10분</option>
+                          <option value="minute-30">30분</option>
+                          <option value="minute-60">60분</option>
+                        </select>
+                      </div>
                     </div>
-                    <div class="sub" id="priceModeLabel">1틱 라인</div>
-                  </div>
-                </div>
+                     <div class="sub" id="priceModeLabel">1틱 라인</div>
+                   </div>
+                 </div>
                 <div id="tradePriceChart" class="chart-canvas"></div>
                </div>
              </div>
@@ -300,7 +345,7 @@ HTML = dedent(
           </div>
         </div>
 
-        <div class="footer">브라우저 연결 동안 collector 서비스가 라이브 KIS upstream을 소유하고, 웹 앱은 해당 스트림을 중계합니다.</div>
+        <div class="footer">브라우저 연결 동안 collector 서비스가 라이브 KIS upstream을 소유해 Kafka로 발행하고, 웹 앱은 Kafka 스트림을 브라우저에 전달합니다.</div>
         <div id="layoutToast" class="toast" role="status" aria-live="polite"></div>
       </div>
 
@@ -323,6 +368,8 @@ HTML = dedent(
           'tick-5': { type: 'tick', size: 5, label: '5틱 라인' },
           'tick-10': { type: 'tick', size: 10, label: '10틱 라인' },
           'tick-30': { type: 'tick', size: 30, label: '30틱 라인' },
+          'minute-1': { type: 'minute', size: 1, label: '1분 캔들' },
+          'minute-5': { type: 'minute', size: 5, label: '5분 캔들' },
           'minute-10': { type: 'minute', size: 10, label: '10분 캔들' },
           'minute-30': { type: 'minute', size: 30, label: '30분 캔들' },
           'minute-60': { type: 'minute', size: 60, label: '60분 캔들' },
@@ -610,6 +657,19 @@ HTML = dedent(
           document.getElementById('priceModeLabel').textContent = priceModeConfig[selectedPriceMode].label;
         }
 
+        function syncPriceModeControls() {
+          const tickSelect = document.getElementById('tickModeSelect');
+          const minuteSelect = document.getElementById('minuteModeSelect');
+          const isTickMode = priceModeConfig[selectedPriceMode]?.type === 'tick';
+          if (isTickMode) {
+            tickSelect.value = selectedPriceMode;
+          } else {
+            minuteSelect.value = selectedPriceMode;
+          }
+          tickSelect.classList.toggle('active', isTickMode);
+          minuteSelect.classList.toggle('active', !isTickMode);
+        }
+
         function updateProgramChartHeader() {
           const nextLabel = selectedProgramMode === 'qty' ? '순매수 체결량' : '순매수 거래대금';
           const nextColor = selectedProgramMode === 'qty' ? '#22c55e' : '#38bdf8';
@@ -728,10 +788,9 @@ HTML = dedent(
         }
 
         function setPriceMode(modeKey) {
+          if (!priceModeConfig[modeKey]) return;
           selectedPriceMode = modeKey;
-          document.querySelectorAll('.price-mode-btn').forEach((button) => {
-            button.classList.toggle('active', button.dataset.priceMode === selectedPriceMode);
-          });
+          syncPriceModeControls();
           updatePriceModeLabel();
           if (priceModeConfig[selectedPriceMode].type === 'tick') {
             if (minuteRefreshTimer) {
@@ -1011,8 +1070,11 @@ HTML = dedent(
           }
         });
         document.getElementById('market').addEventListener('change', handleSelectionChange);
-        document.querySelectorAll('.price-mode-btn').forEach((button) => {
-          button.addEventListener('click', () => setPriceMode(button.dataset.priceMode));
+        document.getElementById('tickModeSelect').addEventListener('change', (event) => {
+          setPriceMode(event.target.value);
+        });
+        document.getElementById('minuteModeSelect').addEventListener('change', (event) => {
+          setPriceMode(event.target.value);
         });
         document.querySelectorAll('.series-btn').forEach((button) => {
           button.addEventListener('click', () => setProgramMode(button.dataset.programMode));
@@ -1042,6 +1104,7 @@ HTML = dedent(
         window.addEventListener('beforeunload', shutdown);
         window.addEventListener('pagehide', shutdown);
         updateProgramChartHeader();
+        syncPriceModeControls();
         updatePriceModeLabel();
         resizeDashboardCharts();
         saveLayout();
@@ -1063,11 +1126,16 @@ async def health() -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+@app.on_event("shutdown")
+async def shutdown_runtime() -> None:
+    await dashboard_broker.aclose()
+
+
 @app.get("/api/price-chart")
 async def price_chart(
     symbol: str = Query(..., min_length=1),
-    market: str = Query("krx", pattern="^(krx|nxt|total)$"),
-    interval: int = Query(..., ge=10, le=60),
+    market: str = Query("total", pattern="^(krx|nxt|total)$"),
+    interval: int = Query(..., ge=1, le=60),
 ) -> JSONResponse:
     try:
         response = await asyncio.to_thread(
@@ -1096,53 +1164,75 @@ async def price_chart(
 async def stream(
     request: Request,
     symbol: str = Query(..., min_length=1),
-    market: str = Query("krx", pattern="^(krx|nxt|total)$"),
+    market: str = Query("total", pattern="^(krx|nxt|total)$"),
 ) -> StreamingResponse:
     async def event_generator() -> Any:
         queue: asyncio.Queue[str | BaseException | None] = asyncio.Queue()
-        loop = asyncio.get_running_loop()
-        stop_event = threading.Event()
-        response_holder: dict[str, requests.Response] = {}
+        control_owner_id = uuid.uuid4().hex
+        consumer_task: asyncio.Task[Any] | None = None
+        disconnect_task: asyncio.Task[Any] | None = None
 
-        def push_queue_item(item: str | BaseException | None) -> None:
-            loop.call_soon_threadsafe(queue.put_nowait, item)
+        async def watch_disconnect() -> None:
+            while not await request.is_disconnected():
+                await asyncio.sleep(0.25)
+            await queue.put(None)
 
-        def pump_collector_stream() -> None:
+        async def pump_dashboard_events() -> None:
             try:
-                with requests.Session() as session:
-                    session.trust_env = False
-                    with session.get(
-                        f"{collector_base_url}/stream",
-                    params={"symbol": symbol, "market": market},
-                    headers={"Accept": "text/event-stream"},
-                    stream=True,
-                    timeout=(5, None),
-                    ) as response:
-                        response_holder["response"] = response
-                        response.raise_for_status()
-                        event_lines: list[str] = []
-                        for line in response.iter_lines(decode_unicode=True):
-                            if stop_event.is_set():
-                                break
-                            normalized_line = line or ""
-                            event_lines.append(normalized_line)
-                            if normalized_line == "":
-                                push_queue_item(_serialize_sse_lines(event_lines))
-                                event_lines = []
-                        if event_lines:
-                            event_lines.append("")
-                            push_queue_item(_serialize_sse_lines(event_lines))
-            except Exception as exc:
-                push_queue_item(exc)
-            finally:
-                push_queue_item(None)
+                async with dashboard_broker.open_subscription(
+                    topic=DASHBOARD_EVENTS_TOPIC,
+                    group_id=_build_dashboard_group_id(symbol=symbol, market=market),
+                ) as consumer:
+                    await _publish_dashboard_control(
+                        action="start",
+                        owner_id=control_owner_id,
+                        symbol=symbol,
+                        market=market,
+                    )
 
-        relay_task = asyncio.create_task(asyncio.to_thread(pump_collector_stream))
+                    async for message in consumer:
+                        if await request.is_disconnected():
+                            return
+
+                        payload = message.value if isinstance(message.value, dict) else None
+                        if payload is None:
+                            continue
+                        if payload.get("symbol") != symbol:
+                            continue
+                        if str(payload.get("market", "")).lower() != market.lower():
+                            continue
+
+                        event_name = payload.get("event_name")
+                        event_payload = payload.get("payload")
+                        if not isinstance(event_name, str) or not isinstance(event_payload, dict):
+                            continue
+
+                        await queue.put(
+                            _serialize_sse_lines(
+                                [
+                                    f"event: {event_name}",
+                                    f"data: {json.dumps(event_payload, ensure_ascii=False)}",
+                                    "",
+                                ]
+                            )
+                        )
+            except Exception as exc:
+                await queue.put(exc)
+            finally:
+                with contextlib.suppress(Exception):
+                    await _publish_dashboard_control(
+                        action="stop",
+                        owner_id=control_owner_id,
+                        symbol=symbol,
+                        market=market,
+                    )
+                await queue.put(None)
+
+        consumer_task = asyncio.create_task(pump_dashboard_events())
+        disconnect_task = asyncio.create_task(watch_disconnect())
 
         try:
             while True:
-                if await request.is_disconnected():
-                    return
                 item = await queue.get()
                 if item is None:
                     return
@@ -1154,12 +1244,13 @@ async def stream(
                 error_payload = {"error": str(exc)}
                 yield f"event: error\ndata: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
         finally:
-            stop_event.set()
-            response = response_holder.get("response")
-            if response is not None:
-                response.close()
-            relay_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await relay_task
+            if consumer_task is not None:
+                consumer_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await consumer_task
+            if disconnect_task is not None:
+                disconnect_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await disconnect_task
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")

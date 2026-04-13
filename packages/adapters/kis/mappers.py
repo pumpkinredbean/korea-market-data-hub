@@ -123,6 +123,18 @@ EVENT_TYPE_BY_CHANNEL: dict[ChannelType, EventType] = {
     ChannelType.PROGRAM_TRADE: EventType.PROGRAM_TRADE,
 }
 
+KIS_REALTIME_COLUMNS_BY_TR_ID: dict[str, tuple[str, ...]] = {
+    "H0STCNT0": KIS_DOMESTIC_STOCK_TRADE_COLUMNS,
+    "H0NXCNT0": KIS_DOMESTIC_STOCK_TRADE_COLUMNS,
+    "H0UNCNT0": KIS_DOMESTIC_STOCK_TRADE_COLUMNS,
+    "H0STASP0": KIS_DOMESTIC_STOCK_ORDER_BOOK_COLUMNS,
+    "H0NXASP0": KIS_DOMESTIC_STOCK_ORDER_BOOK_COLUMNS,
+    "H0UNASP0": KIS_DOMESTIC_STOCK_ORDER_BOOK_COLUMNS,
+    "H0STPGM0": KIS_DOMESTIC_STOCK_PROGRAM_TRADE_COLUMNS,
+    "H0NXPGM0": KIS_DOMESTIC_STOCK_PROGRAM_TRADE_COLUMNS,
+    "H0UNPGM0": KIS_DOMESTIC_STOCK_PROGRAM_TRADE_COLUMNS,
+}
+
 
 @dataclass(frozen=True, slots=True)
 class KISSubscriptionBinding:
@@ -177,13 +189,10 @@ def resolve_event_type(subscription: SubscriptionSpec) -> EventType:
 def resolve_realtime_columns(tr_id: str) -> tuple[str, ...]:
     """Return the known leading raw columns for a supported realtime TR."""
 
-    if tr_id == "H0STCNT0":
-        return KIS_DOMESTIC_STOCK_TRADE_COLUMNS
-    if tr_id == "H0STASP0":
-        return KIS_DOMESTIC_STOCK_ORDER_BOOK_COLUMNS
-    if tr_id == "H0STPGM0":
-        return KIS_DOMESTIC_STOCK_PROGRAM_TRADE_COLUMNS
-    raise KeyError(f"Unsupported realtime TR ID: {tr_id}")
+    try:
+        return KIS_REALTIME_COLUMNS_BY_TR_ID[tr_id]
+    except KeyError as exc:
+        raise KeyError(f"Unsupported realtime TR ID: {tr_id}") from exc
 
 
 def map_trade_event(row: KISRealtimeRow) -> CanonicalEvent[Trade]:

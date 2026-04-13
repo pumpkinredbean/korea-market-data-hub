@@ -80,9 +80,12 @@ services:
       APP_ENV: docker
       APP_HOST: 0.0.0.0
       APP_PORT: 8000
+      BOOTSTRAP_SERVERS: redpanda:9092
       COLLECTOR_BASE_URL: http://collector:8001
     ports:
       - "8000:8000"
     depends_on:
+      redpanda:
+        condition: service_healthy
       collector:
         condition: service_started

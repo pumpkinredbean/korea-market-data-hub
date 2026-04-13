@@ -40,6 +40,9 @@ ORDER_BOOK_RENAME_MAP = {
 }
 
 
+SUPPORTED_LIVE_MARKETS = {"krx", "nxt", "total"}
+
+
 def _to_native_number(value: Any) -> int | float | str | None:
     if value is None:
         return None
@@ -77,44 +80,97 @@ def _format_dashboard_event(event: MarketDataEvent) -> tuple[str, dict[str, Any]
 
 
 def _aggregate_minute_candles(rows: list[dict[str, Any]], interval: int) -> list[dict[str, Any]]:
-    buckets: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = None
+    normalized_rows: list[dict[str, Any]] = []
 
-    for row in rows:
+    for index, row in enumerate(rows):
         time_text = str(row.get("stck_cntg_hour") or "").strip()
         if len(time_text) != 6 or not time_text.isdigit():
             continue
 
         try:
+            point_time = datetime.strptime(time_text, "%H%M%S")
             price = float(row.get("stck_prpr", 0) or 0)
-            open_price = float(row.get("stck_oprc", 0) or 0)
-            high_price = float(row.get("stck_hgpr", 0) or 0)
-            low_price = float(row.get("stck_lwpr", 0) or 0)
+            open_price = float(row.get("stck_oprc", 0) or 0) or price
+            high_price = float(row.get("stck_hgpr", 0) or 0) or price
+            low_price = float(row.get("stck_lwpr", 0) or 0) or price
             volume = int(float(row.get("cntg_vol", 0) or 0))
         except (TypeError, ValueError):
             continue
 
-        point_time = datetime.strptime(time_text, "%H%M%S")
-        bucket_minute = (point_time.minute // interval) * interval
-        bucket_time = point_time.replace(minute=bucket_minute, second=0)
-        bucket_key = bucket_time.strftime("%H%M")
-
-        if current is None or current["key"] != bucket_key:
-            current = {
-                "key": bucket_key,
-                "label": bucket_time.strftime("%H:%M"),
+        normalized_rows.append(
+            {
+                "time_text": time_text,
+                "point_time": point_time,
+                "source_index": index,
+                "price": price,
                 "open": open_price,
-                "high": high_price,
-                "low": low_price,
-                "close": price,
-                "volume": volume,
+                "high": max(high_price, price, open_price),
+                "low": min(low_price, price, open_price),
+                "volume": max(volume, 0),
             }
-            buckets.append(current)
-        else:
-            current["high"] = max(current["high"], high_price)
-            current["low"] = min(current["low"], low_price)
-            current["close"] = price
-            current["volume"] += volume
+        )
+
+    normalized_rows.sort(key=lambda item: (item["time_text"], item["source_index"]))
+
+    deduped_rows: list[dict[str, Any]] = []
+    current_time: str | None = None
+    current_row: dict[str, Any] | None = None
+    seen_signatures: set[tuple[Any, ...]] = set()
+
+    for row in normalized_rows:
+        signature = (row["time_text"], row["open"], row["high"], row["low"], row["price"], row["volume"])
+        if row["time_text"] != current_time:
+            if current_row is not None:
+                deduped_rows.append(current_row)
+            current_time = row["time_text"]
+            seen_signatures = {signature}
+            current_row = dict(row)
+            continue
+
+        if signature in seen_signatures:
+            continue
+
+        seen_signatures.add(signature)
+        assert current_row is not None
+        current_row["open"] = current_row["open"] or row["open"]
+        current_row["high"] = max(current_row["high"], row["high"], row["price"])
+        current_row["low"] = min(current_row["low"], row["low"], row["price"])
+        if row["volume"] >= current_row["volume"]:
+            current_row["price"] = row["price"]
+        current_row["volume"] = max(current_row["volume"], row["volume"])
+
+    if current_row is not None:
+        deduped_rows.append(current_row)
+
+    buckets: list[dict[str, Any]] = []
+    current_bucket: dict[str, Any] | None = None
+
+    for row in deduped_rows:
+        point_time = row["point_time"]
+        total_minutes = point_time.hour * 60 + point_time.minute
+        bucket_total_minutes = (total_minutes // interval) * interval
+        bucket_hour = bucket_total_minutes // 60
+        bucket_minute = bucket_total_minutes % 60
+        bucket_label = f"{bucket_hour:02d}:{bucket_minute:02d}"
+        bucket_key = f"{bucket_hour:02d}{bucket_minute:02d}"
+
+        if current_bucket is None or current_bucket["key"] != bucket_key:
+            current_bucket = {
+                "key": bucket_key,
+                "label": bucket_label,
+                "open": row["open"],
+                "high": row["high"],
+                "low": row["low"],
+                "close": row["price"],
+                "volume": row["volume"],
+            }
+            buckets.append(current_bucket)
+            continue
+
+        current_bucket["high"] = max(current_bucket["high"], row["high"], row["price"])
+        current_bucket["low"] = min(current_bucket["low"], row["low"], row["price"])
+        current_bucket["close"] = row["price"]
+        current_bucket["volume"] += row["volume"]
 
     return buckets[-120:]
 
@@ -130,11 +186,11 @@ class CollectorRuntime:
         await self._chart_client.aclose()
 
     async def stream_dashboard(self, *, symbol: str, market: str) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-        if market.lower() != "krx":
-            raise NotImplementedError("collector-owned live dashboard runtime currently supports only KRX")
-
+        normalized_market = market.strip().lower()
+        if normalized_market not in SUPPORTED_LIVE_MARKETS:
+            raise ValueError(f"unsupported live market: {market}")
         instrument = InstrumentRef(symbol=symbol, instrument_id=symbol, venue=Venue.KRX)
-        async for event in self._adapter.stream_dashboard_events(instrument):
+        async for event in self._adapter.stream_dashboard_events(instrument, market=normalized_market):
             yield _format_dashboard_event(event)
 
     def fetch_price_chart(self, *, symbol: str, market: str, interval: int) -> dict[str, Any]:

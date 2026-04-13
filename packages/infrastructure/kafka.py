@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -31,15 +32,20 @@ class AsyncKafkaJsonBroker:
         producer = await self._ensure_producer_started()
         await producer.send_and_wait(topic, value=value, key=key.encode("utf-8") if key is not None else None)
 
-    async def subscribe(self, *, topic: str, group_id: str) -> AsyncIterator[dict[str, Any]]:
+    @asynccontextmanager
+    async def open_subscription(self, *, topic: str, group_id: str) -> AsyncIterator[Any]:
         consumer = self._build_consumer(topic=topic, group_id=group_id)
         await consumer.start()
         try:
+            yield consumer
+        finally:
+            await consumer.stop()
+
+    async def subscribe(self, *, topic: str, group_id: str) -> AsyncIterator[dict[str, Any]]:
+        async with self.open_subscription(topic=topic, group_id=group_id) as consumer:
             async for message in consumer:
                 if isinstance(message.value, dict):
                     yield message.value
-        finally:
-            await consumer.stop()
 
     async def _ensure_producer_started(self) -> Any:
         if AIOKafkaProducer is None:

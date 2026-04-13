@@ -45,3 +45,15 @@ class DashboardEventEnvelope:
     payload: dict[str, Any]
     published_at: datetime
     schema_version: str = "v1"
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardControlEnvelope:
+    """Broker-neutral envelope for dashboard publication control."""
+
+    action: str
+    owner_id: str
+    symbol: str
+    market: str
+    requested_at: datetime
+    schema_version: str = "v1"
