@@ -1,4 +1,4 @@
-name: ksxt
+name: korea-market-data-hub
 
 services:
   redpanda:

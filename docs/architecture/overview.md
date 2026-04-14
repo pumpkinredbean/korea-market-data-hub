@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This repository is evolving into a reusable real-time market data stack for Korean equities and related workflows. The current live integration is KIS, but the long-term architecture is broker-agnostic.
+`korea-market-data-hub` is evolving into a reusable real-time market data hub stack for Korean equities and related workflows. The current live integration is KIS, but the long-term architecture is broker-agnostic.
 
 ## Current direction
 
@@ -21,7 +21,7 @@ broker adapter -> collector -> Kafka/Redpanda dashboard topic -> api/web -> brow
                      -> processor -> analytical storage
 ```
 
-Today, the repo already contains the monorepo skeleton for that shape:
+Today, `korea-market-data-hub` already contains the monorepo skeleton for that shape:
 
 - `apps/collector`: FastAPI collector service that owns the live KIS upstream/runtime, publishes dashboard events, exposes start/stop control endpoints, and relays price-chart fetches
 - `apps/processor`: placeholder service for downstream processing-stage wiring

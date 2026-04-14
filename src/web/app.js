@@ -8,8 +8,8 @@
   const reconnectDelayMs = 1200;
   const minuteRefreshMs = 30000;
   const kstOffsetSeconds = 9 * 60 * 60;
-  const workingLayoutStorageKey = 'ksxt.dashboard-layout.v3';
-  const preferredLayoutStorageKey = 'ksxt.dashboard-layout.preferred.v3';
+  const workingLayoutStorageKey = 'korea-market-data-hub.dashboard-layout.v3';
+  const preferredLayoutStorageKey = 'korea-market-data-hub.dashboard-layout.preferred.v3';
   const historyRows = [];
   const rawProgramTrades = [];
   const rawTradePrices = [];
