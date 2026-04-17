@@ -38,6 +38,7 @@ services:
     command: python -m apps.collector.service
     volumes:
       - .:/app
+      - /Users/minkyu/workspace/ksxt:/opt/ksxt:ro
     env_file:
       - .env
     environment:
@@ -47,6 +48,7 @@ services:
       BOOTSTRAP_SERVERS: redpanda:9092
       CLICKHOUSE_URL: http://clickhouse:8123
       POLL_INTERVAL_SECONDS: 30
+      PYTHONPATH: /app:/opt/ksxt/src
     ports:
       - "8001:8001"
     depends_on:
@@ -78,6 +80,8 @@ services:
     command: uvicorn apps.api_web.app:app --host 0.0.0.0 --port 8000
     volumes:
       - .:/app
+      - /Users/minkyu/workspace/ksxt:/opt/ksxt:ro
+      - /var/run/docker.sock:/var/run/docker.sock
     env_file:
       - .env
     environment:
@@ -86,6 +90,9 @@ services:
       APP_PORT: 8000
       BOOTSTRAP_SERVERS: redpanda:9092
       COLLECTOR_BASE_URL: http://collector:8001
+      COMPOSE_PROJECT_NAME: korea-market-data-hub
+      COLLECTOR_SERVICE_NAME: collector
+      PYTHONPATH: /app:/opt/ksxt/src
     ports:
       - "8000:8000"
     depends_on:

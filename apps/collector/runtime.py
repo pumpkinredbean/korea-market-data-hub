@@ -2,16 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
+
+from ksxt import (
+    BarTimeframe as KSXTBarTimeframe,
+    InstrumentRef as KSXTInstrumentRef,
+    KISClient,
+    MarketBar as KSXTMarketBar,
+    Venue as KSXTVenue,
+)
 
 from packages.adapters.base import MarketDataEvent
 from packages.adapters.kis.adapter import KISMarketDataAdapter
 from packages.contracts import ChannelType, EventType
 from packages.domain.enums import Venue
 from packages.domain.models import InstrumentRef
-from src.kis_websocket import KISProgramTradeClient
+
+logger = logging.getLogger(__name__)
 
 
 TRADE_PRICE_RENAME_MAP = {
@@ -116,137 +126,59 @@ def _format_dashboard_event(event: MarketDataEvent) -> tuple[str, dict[str, Any]
     return "program_trade", payload
 
 
-def _parse_session_date(value: Any) -> date | None:
-    text = str(value or "").strip()
-    if len(text) != 10:
-        return None
+_KST = timezone(timedelta(hours=9))
+
+
+def _decimal_to_float(value: Any) -> float:
     try:
-        return date.fromisoformat(text)
-    except ValueError:
-        return None
+        return float(value) if value is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
-def _resolve_row_session_date(row: dict[str, Any], fallback: date) -> date:
-    for key in ("stck_bsop_date", "bsop_date", "trade_date"):
-        raw = row.get(key)
-        text = str(raw or "").strip()
-        if len(text) == 8 and text.isdigit():
-            try:
-                return datetime.strptime(text, "%Y%m%d").date()
-            except ValueError:
-                continue
-    return fallback
-
-
-def _aggregate_minute_candles(rows: list[dict[str, Any]], interval: int, *, session_date: date) -> list[dict[str, Any]]:
-    kst = timezone(timedelta(hours=9))
-    normalized_rows: list[dict[str, Any]] = []
-
-    for index, row in enumerate(rows):
-        time_text = str(row.get("stck_cntg_hour") or "").strip()
-        if len(time_text) != 6 or not time_text.isdigit():
-            continue
-
+def _decimal_to_int(value: Any) -> int:
+    try:
+        return int(value) if value is not None else 0
+    except (TypeError, ValueError):
         try:
-            point_time = datetime.strptime(time_text, "%H%M%S")
-            price = float(row.get("stck_prpr", 0) or 0)
-            open_price = float(row.get("stck_oprc", 0) or 0) or price
-            high_price = float(row.get("stck_hgpr", 0) or 0) or price
-            low_price = float(row.get("stck_lwpr", 0) or 0) or price
-            volume = int(float(row.get("cntg_vol", 0) or 0))
+            return int(float(value))
         except (TypeError, ValueError):
-            continue
+            return 0
 
-        normalized_rows.append(
+
+def _format_market_bars(bars: tuple[KSXTMarketBar, ...]) -> list[dict[str, Any]]:
+    """Format KSXT MarketBar tuple into dashboard candle dicts (shape-only).
+
+    Bucketing is performed by the KSXT client via ``interval_minutes``; this
+    function does not re-aggregate rows.
+    """
+
+    formatted: list[dict[str, Any]] = []
+    for bar in bars:
+        opened_at = bar.opened_at
+        if opened_at.tzinfo is None:
+            opened_at_kst = opened_at.replace(tzinfo=_KST)
+        else:
+            opened_at_kst = opened_at.astimezone(_KST)
+
+        formatted.append(
             {
-                "time_text": time_text,
-                "point_time": point_time,
-                "session_date": _resolve_row_session_date(row, session_date),
-                "source_index": index,
-                "price": price,
-                "open": open_price,
-                "high": max(high_price, price, open_price),
-                "low": min(low_price, price, open_price),
-                "volume": max(volume, 0),
+                "time": int(opened_at_kst.timestamp()),
+                "label": opened_at_kst.strftime("%H:%M"),
+                "session_date": opened_at_kst.date().isoformat(),
+                "source_time": opened_at_kst.strftime("%H%M%S"),
+                "open": _decimal_to_float(bar.open),
+                "high": _decimal_to_float(bar.high),
+                "low": _decimal_to_float(bar.low),
+                "close": _decimal_to_float(bar.close),
+                "volume": _decimal_to_int(bar.volume),
             }
         )
+    return formatted[-120:]
 
-    normalized_rows.sort(key=lambda item: (item["time_text"], item["source_index"]))
 
-    deduped_rows: list[dict[str, Any]] = []
-    current_time: str | None = None
-    current_row: dict[str, Any] | None = None
-    seen_signatures: set[tuple[Any, ...]] = set()
-
-    for row in normalized_rows:
-        signature = (row["time_text"], row["open"], row["high"], row["low"], row["price"], row["volume"])
-        if row["time_text"] != current_time:
-            if current_row is not None:
-                deduped_rows.append(current_row)
-            current_time = row["time_text"]
-            seen_signatures = {signature}
-            current_row = dict(row)
-            continue
-
-        if signature in seen_signatures:
-            continue
-
-        seen_signatures.add(signature)
-        assert current_row is not None
-        current_row["open"] = current_row["open"] or row["open"]
-        current_row["high"] = max(current_row["high"], row["high"], row["price"])
-        current_row["low"] = min(current_row["low"], row["low"], row["price"])
-        if row["volume"] >= current_row["volume"]:
-            current_row["price"] = row["price"]
-        current_row["volume"] = max(current_row["volume"], row["volume"])
-
-    if current_row is not None:
-        deduped_rows.append(current_row)
-
-    buckets: list[dict[str, Any]] = []
-    current_bucket: dict[str, Any] | None = None
-
-    for row in deduped_rows:
-        point_time = row["point_time"]
-        total_minutes = point_time.hour * 60 + point_time.minute
-        bucket_total_minutes = (total_minutes // interval) * interval
-        bucket_hour = bucket_total_minutes // 60
-        bucket_minute = bucket_total_minutes % 60
-        bucket_label = f"{bucket_hour:02d}:{bucket_minute:02d}"
-        bucket_session_date = row["session_date"]
-        bucket_key = f"{bucket_session_date.isoformat()}-{bucket_hour:02d}{bucket_minute:02d}"
-        bucket_dt = datetime(
-            bucket_session_date.year,
-            bucket_session_date.month,
-            bucket_session_date.day,
-            bucket_hour,
-            bucket_minute,
-            tzinfo=kst,
-        )
-
-        if current_bucket is None or current_bucket["key"] != bucket_key:
-            current_bucket = {
-                "key": bucket_key,
-                "time": int(bucket_dt.timestamp()),
-                "label": bucket_label,
-                "session_date": bucket_session_date.isoformat(),
-                "source_time": row["time_text"],
-                "open": row["open"],
-                "high": row["high"],
-                "low": row["low"],
-                "close": row["price"],
-                "volume": row["volume"],
-            }
-            buckets.append(current_bucket)
-            continue
-
-        current_bucket["high"] = max(current_bucket["high"], row["high"], row["price"])
-        current_bucket["low"] = min(current_bucket["low"], row["low"], row["price"])
-        current_bucket["close"] = row["price"]
-        current_bucket["source_time"] = row["time_text"]
-        current_bucket["volume"] += row["volume"]
-
-    return buckets[-120:]
+_BASE_RECONNECT_DELAY: float = 1.0
+_MAX_RECONNECT_DELAY: float = 30.0
 
 
 class CollectorRuntime:
@@ -258,11 +190,17 @@ class CollectorRuntime:
         *,
         on_event: Callable[..., Awaitable[None]] | None = None,
         on_failure: Callable[..., Awaitable[None]] | None = None,
+        on_recovery: Callable[..., Awaitable[None]] | None = None,
     ):
         self._adapter = KISMarketDataAdapter(settings)
-        self._chart_client = KISProgramTradeClient(settings)
+        self._chart_client = KISClient(
+            app_key=settings.app_key,
+            app_secret=settings.app_secret,
+            sandbox=False,
+        )
         self._on_event = on_event
         self._on_failure = on_failure
+        self._on_recovery = on_recovery
         self._lock = asyncio.Lock()
         self._refresh_event = asyncio.Event()
         self._registrations_by_owner: dict[str, RuntimeTargetRegistration] = {}
@@ -327,6 +265,7 @@ class CollectorRuntime:
             self._upstream_task = asyncio.create_task(self._run_upstream_session())
 
     async def _run_upstream_session(self) -> None:
+        reconnect_delay: float = 0.0
         while not self._closed:
             refresh_event = self._refresh_event
             refresh_event.clear()
@@ -338,6 +277,9 @@ class CollectorRuntime:
 
             try:
                 auth = await self._adapter.auth.issue_realtime_credentials()
+                # Signal recovery to clear any stale per-target error state before
+                # the new session starts delivering events.
+                await self._broadcast_recovery()
                 async for row in self._adapter.realtime.stream_subscriptions_rows_until(
                     plan.subscriptions,
                     auth,
@@ -356,16 +298,26 @@ class CollectorRuntime:
                     if event_context.event_name not in plan.requested_event_names_by_key.get(event_context.stream_key, set()):
                         continue
                     await self._publish_event(event_context, published_event_name=published_event_name)
+                # Clean session end (refresh requested or no subscriptions left); reset backoff.
+                reconnect_delay = 0.0
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 await self._broadcast_failure(exc)
                 if self._closed:
                     return
+                # Bounded exponential backoff: start at _BASE_RECONNECT_DELAY, double on
+                # each successive failure, cap at _MAX_RECONNECT_DELAY.  A user-triggered
+                # refresh (register/unregister) sets refresh_event and breaks the wait
+                # immediately so mutations are never delayed by the backoff.
+                reconnect_delay = min(
+                    _BASE_RECONNECT_DELAY if reconnect_delay == 0.0 else reconnect_delay * 2,
+                    _MAX_RECONNECT_DELAY,
+                )
                 try:
-                    await asyncio.wait_for(refresh_event.wait(), timeout=1)
+                    await asyncio.wait_for(refresh_event.wait(), timeout=reconnect_delay)
                 except TimeoutError:
-                    continue
+                    pass
 
     async def _build_upstream_plan(self) -> _UpstreamPlan:
         async with self._lock:
@@ -412,6 +364,19 @@ class CollectorRuntime:
                 error=str(exc),
             )
 
+    async def _broadcast_recovery(self) -> None:
+        """Notify the service layer that a new session has started so stale per-target
+        error state can be cleared before events begin arriving again."""
+        if self._on_recovery is None:
+            return
+        async with self._lock:
+            stream_keys = tuple({registration.stream_key for registration in self._registrations_by_owner.values()})
+        for stream_key in stream_keys:
+            await self._on_recovery(
+                symbol=stream_key.symbol,
+                market_scope=stream_key.market_scope,
+            )
+
     def _build_stream_key(self, *, symbol: str, market_scope: str) -> DashboardStreamKey:
         normalized_market_scope = market_scope.strip().lower()
         if normalized_market_scope not in SUPPORTED_MARKET_SCOPES:
@@ -439,19 +404,40 @@ class CollectorRuntime:
             raise ValueError("at least one event type is required")
         return tuple(normalized)
 
-    def fetch_price_chart(self, *, symbol: str, market_scope: str, interval: int) -> dict[str, Any]:
-        chart_payload = self._chart_client.fetch_intraday_chart(symbol=symbol, market=market_scope)
-        rows = chart_payload.get("rows") if isinstance(chart_payload, dict) else []
-        session_date = _parse_session_date(chart_payload.get("session_date")) if isinstance(chart_payload, dict) else None
-        resolved_session_date = session_date or datetime.now(timezone(timedelta(hours=9))).date()
-        candles = _aggregate_minute_candles(rows, interval, session_date=resolved_session_date)
+    async def fetch_price_chart(self, *, symbol: str, market_scope: str, interval: int) -> dict[str, Any]:
+        normalized_scope = (market_scope or "").strip().lower() or "krx"
+        scope_fallback = normalized_scope != "krx"
+        if scope_fallback:
+            logger.warning(
+                "KSXT does not differentiate market_scope=%s; requesting KRX bars",
+                normalized_scope,
+            )
+
+        instrument = KSXTInstrumentRef(symbol=symbol, venue=KSXTVenue.KRX)
+        # Match the legacy hub behavior of anchoring intraday requests to the
+        # KST 15:30 session close so late-session calls still cover the full
+        # trading day.
+        end = datetime.now(_KST).replace(hour=15, minute=30, second=0, microsecond=0)
+        bars = await self._chart_client.fetch_bars(
+            instrument,
+            timeframe=KSXTBarTimeframe.MINUTE,
+            end=end,
+            interval_minutes=interval,
+        )
+        candles = _format_market_bars(bars)
+        session_date = (
+            candles[-1]["session_date"]
+            if candles
+            else datetime.now(_KST).date().isoformat()
+        )
         return {
             "symbol": symbol,
             "market_scope": market_scope,
             "market": market_scope,
             "interval": interval,
             "candles": candles,
-            "session_date": resolved_session_date.isoformat(),
-            "source": "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+            "session_date": session_date,
+            "source": "ksxt:KISClient.fetch_bars",
             "tr_id": "FHKST03010200",
+            "scope_fallback": scope_fallback,
         }

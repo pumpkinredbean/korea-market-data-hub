@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from apps.collector.publisher import CollectorPublisher
@@ -72,6 +73,7 @@ class CollectorDashboardService:
             kis_settings,
             on_event=self._handle_runtime_event,
             on_failure=self._handle_runtime_failure,
+            on_recovery=self._handle_runtime_recovery,
         )
         self._broker = AsyncKafkaJsonBroker(settings.bootstrap_servers)
         self._publisher = CollectorPublisher(self._broker)
@@ -154,8 +156,7 @@ class CollectorDashboardService:
         }
 
     async def fetch_price_chart(self, *, symbol: str, market_scope: str, interval: int) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self._collector_runtime.fetch_price_chart,
+        return await self._collector_runtime.fetch_price_chart(
             symbol=symbol,
             market_scope=market_scope,
             interval=interval,
@@ -200,6 +201,10 @@ class CollectorDashboardService:
             limit=limit,
         )
         return jsonable_encoder(result)
+
+    def subscribe_events(self):
+        """Return an async context manager yielding a push queue of RecentRuntimeEvent objects."""
+        return self._control_plane.subscribe_events()
 
     def is_publication_active(self, owner_id: str) -> bool:
         return self._collector_runtime.is_target_active(owner_id)
@@ -257,6 +262,13 @@ class CollectorDashboardService:
         logger.error(
             "collector dashboard upstream failed",
             extra={"symbol": symbol, "market_scope": market_scope},
+        )
+
+    async def _handle_runtime_recovery(self, *, symbol: str, market_scope: str) -> None:
+        """Clear stale error state for a symbol/market_scope when a new session starts."""
+        await self._control_plane.clear_publication_errors(
+            symbol=symbol,
+            market_scope=market_scope,
         )
 
     def _build_subscription(self, *, symbol: str, market_scope: str) -> DashboardSubscription:
@@ -343,6 +355,97 @@ async def admin_recent_events(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return JSONResponse(payload)
+
+
+@app.get("/admin/events/stream")
+async def admin_events_stream(
+    request: Request,
+    target_id: str | None = Query(None),
+    symbol: str | None = Query(None),
+    scope: str | None = Query(None, pattern="^(krx|nxt|total)$"),
+    market: str | None = Query(None, pattern="^(krx|nxt|total)$"),
+    event_name: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+) -> StreamingResponse:
+    """True push SSE stream for admin runtime events — no polling."""
+    try:
+        market_scope_filter = _resolve_market_scope(scope=scope, market=market) if (scope or market) else None
+    except ValueError as exc:
+        async def _error_gen() -> Any:
+            yield f"event: upstream_error\ndata: {json.dumps({'error': str(exc)}, ensure_ascii=False)}\n\n"
+        return StreamingResponse(_error_gen(), media_type="text/event-stream")
+
+    normalized_symbol = symbol.strip() if symbol else None
+    normalized_target_id = target_id.strip() if target_id else None
+    normalized_event_name = event_name.strip().lower() if event_name else None
+
+    async def event_generator() -> Any:
+        # Immediately acknowledge the connection.
+        yield "event: connected\ndata: {}\n\n"
+
+        # Send the current buffer snapshot so the client sees existing events right away.
+        try:
+            initial = await dashboard_service.recent_runtime_events(
+                target_id=normalized_target_id,
+                symbol=normalized_symbol,
+                market_scope=market_scope_filter,
+                event_name=normalized_event_name,
+                limit=limit,
+            )
+            initial_events = initial.get("recent_events") or []
+            known_event_names: set[str] = set(initial.get("available_event_names") or [])
+            if initial_events:
+                batch = {
+                    "new_events": initial_events,
+                    "available_event_names": sorted(known_event_names),
+                    "buffer_size": initial.get("buffer_size") or 0,
+                    "captured_at": str(initial.get("captured_at") or ""),
+                }
+                yield f"event: events\ndata: {json.dumps(batch, ensure_ascii=False, default=str)}\n\n"
+        except Exception as exc:
+            yield f"event: upstream_error\ndata: {json.dumps({'error': str(exc)}, ensure_ascii=False)}\n\n"
+            known_event_names = set()
+
+        # Stream new events as they are pushed by record_runtime_event().
+        async with dashboard_service.subscribe_events() as queue:
+            while True:
+                if await request.is_disconnected():
+                    return
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    # Send a keep-alive comment to prevent proxy/browser timeouts.
+                    yield ": heartbeat\n\n"
+                    continue
+
+                # Apply per-subscriber filters.
+                if normalized_target_id and normalized_target_id not in event.matched_target_ids:
+                    continue
+                if normalized_symbol and event.symbol != normalized_symbol:
+                    continue
+                if market_scope_filter and event.market_scope != market_scope_filter:
+                    continue
+                if normalized_event_name and event.event_name != normalized_event_name:
+                    continue
+
+                known_event_names.add(event.event_name)
+                serialized = jsonable_encoder(event)
+                batch = {
+                    "new_events": [serialized],
+                    "available_event_names": sorted(known_event_names),
+                    "buffer_size": 0,
+                    "captured_at": serialized.get("published_at", ""),
+                }
+                yield f"event: events\ndata: {json.dumps(batch, ensure_ascii=False, default=str)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.on_event("shutdown")
