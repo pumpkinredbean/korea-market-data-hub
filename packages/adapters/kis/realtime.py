@@ -64,12 +64,21 @@ class KISRealtimeClient:
         )
 
     def connect(self):
-        """Open a websocket connection to the KIS realtime endpoint."""
+        """Open a websocket connection to the KIS realtime endpoint.
+
+        KIS uses its own application-level PINGPONG keep-alive (tr_id == "PINGPONG"
+        frames that the client must echo back with ws.pong()).  Enabling the
+        websockets library's protocol-level ping on top of that causes a duplicate
+        keep-alive path: KIS never responds to RFC-6455 pings, which triggers a
+        ``sent 1011 (internal error) keepalive ping timeout`` close and drops the
+        connection.  Disable protocol-level pings so only the app-level PINGPONG
+        path is active.
+        """
 
         return websockets.connect(
             f"{self._settings.ws_url}/tryitout",
-            ping_interval=30,
-            ping_timeout=30,
+            ping_interval=None,
+            ping_timeout=None,
         )
 
     async def subscribe_many(
