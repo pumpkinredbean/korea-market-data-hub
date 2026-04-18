@@ -38,7 +38,7 @@ services:
     command: python -m apps.collector.service
     volumes:
       - .:/app
-      - /Users/minkyu/workspace/ksxt:/opt/ksxt:ro
+      - /Users/minkyu/workspace/kxt:/opt/kxt:ro
     env_file:
       - .env
     environment:
@@ -48,9 +48,9 @@ services:
       BOOTSTRAP_SERVERS: redpanda:9092
       CLICKHOUSE_URL: http://clickhouse:8123
       POLL_INTERVAL_SECONDS: 30
-      PYTHONPATH: /app:/opt/ksxt/src
-      # hub-D: KSXT websocket proxy policy (default=direct). See .env.example.
-      KSXT_KIS_WS_PROXY: ${KSXT_KIS_WS_PROXY:-direct}
+      PYTHONPATH: /app:/opt/kxt/src
+      # hub-D: kxt websocket proxy policy (default=direct). See .env.example.
+      KXT_KIS_WS_PROXY: ${KXT_KIS_WS_PROXY:-direct}
     ports:
       - "8001:8001"
     depends_on:
@@ -82,7 +82,7 @@ services:
     command: uvicorn apps.api_web.app:app --host 0.0.0.0 --port 8000
     volumes:
       - .:/app
-      - /Users/minkyu/workspace/ksxt:/opt/ksxt:ro
+      - /Users/minkyu/workspace/kxt:/opt/kxt:ro
       - /var/run/docker.sock:/var/run/docker.sock
     env_file:
       - .env
@@ -94,7 +94,7 @@ services:
       COLLECTOR_BASE_URL: http://collector:8001
       COMPOSE_PROJECT_NAME: korea-market-data-hub
       COLLECTOR_SERVICE_NAME: collector
-      PYTHONPATH: /app:/opt/ksxt/src
+      PYTHONPATH: /app:/opt/kxt/src
     ports:
       - "8000:8000"
     depends_on:

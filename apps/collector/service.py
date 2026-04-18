@@ -16,7 +16,7 @@ import uvicorn
 def _setup_logging() -> None:
     """Configure structured logging for collector process.
 
-    Attaches a single stderr handler to ``apps.collector.*`` and ``ksxt.*``
+    Attaches a single stderr handler to ``apps.collector.*`` and ``kxt.*``
     loggers so subscribe/recovery/permanent-failure events are always visible
     regardless of uvicorn access-log configuration. Honors ``LOG_LEVEL`` env.
     Idempotent — dictConfig replaces any prior configuration.
@@ -45,7 +45,7 @@ def _setup_logging() -> None:
                     "level": level,
                     "propagate": False,
                 },
-                "ksxt": {
+                "kxt": {
                     "handlers": ["hub_stderr"],
                     "level": level,
                     "propagate": False,

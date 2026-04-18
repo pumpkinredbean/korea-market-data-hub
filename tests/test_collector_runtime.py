@@ -57,7 +57,7 @@ class CollectorRuntimeImportTests(unittest.TestCase):
             )
 
     def test_runtime_uses_ksxt_session(self) -> None:
-        from ksxt import KISRealtimeSession, RealtimeState
+        from kxt import KISRealtimeSession, RealtimeState
 
         # Sanity: public exports referenced by the runtime exist.
         self.assertTrue(hasattr(KISRealtimeSession, "subscribe"))
@@ -303,7 +303,7 @@ class PermanentFailureContractTests(unittest.IsolatedAsyncioTestCase):
     """
 
     async def test_permanent_failure_marks_target_on_subscription_error(self) -> None:
-        from ksxt import KISSubscriptionError, StreamKind, InstrumentRef as KSXTInstrumentRef, Venue as KSXTVenue
+        from kxt import KISSubscriptionError, StreamKind, InstrumentRef as KSXTInstrumentRef, Venue as KSXTVenue
 
         permanent_calls: list[dict[str, object]] = []
 
@@ -413,7 +413,7 @@ class SubscribeAckTimeoutWatchdogTests(unittest.IsolatedAsyncioTestCase):
                 yield  # pragma: no cover
 
             # Target B: events() yields one KSXTTradeEvent then parks.
-            from ksxt import (
+            from kxt import (
                 InstrumentRef as KSXTInstrumentRef,
                 TradeEvent as KSXTTradeEvent,
                 Venue as KSXTVenue,

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Awaitable, Callable
 
-from ksxt import (
+from kxt import (
     BarTimeframe as KSXTBarTimeframe,
     InstrumentRef as KSXTInstrumentRef,
     KISClient,
