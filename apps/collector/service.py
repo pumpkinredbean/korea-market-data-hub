@@ -324,8 +324,13 @@ class CollectorDashboardService:
 
     async def _handle_runtime_recovery(self) -> None:
         """Clear transient error state across all targets and flash a meta event to admin UI."""
-        await self._control_plane.clear_all_publication_errors()
+        logger.info("collector runtime recovery: begin")
+        cleared = await self._control_plane.clear_all_publication_errors()
         await self._control_plane.broadcast_session_recovered()
+        logger.info(
+            "collector runtime recovery: end cleared=%s",
+            cleared,
+        )
 
     async def _handle_runtime_session_state(self, *, state: str, previous: str) -> None:
         """Forward KSXT session state transitions into the admin control plane."""

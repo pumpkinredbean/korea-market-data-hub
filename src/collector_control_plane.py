@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -9,6 +10,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from packages.contracts.admin import ControlPlaneSnapshot, EventTypeCatalogEntry, RecentRuntimeEvent
 from packages.contracts.events import EventType
@@ -358,18 +361,28 @@ class CollectorControlPlaneService:
             if cleared_any:
                 self._last_service_error = None
 
-    async def clear_all_publication_errors(self) -> None:
+    async def clear_all_publication_errors(self) -> int:
         """Clear transient per-target error state across the board.
 
         Called when the KSXT session reports ``on_recovery`` so stale errors
         set by a previous cycle failure are cleared before fresh events start
         arriving.  Permanent failures are intentionally left untouched.
+
+        Returns the number of targets whose transient error was actually
+        cleared so recovery paths can be observed in logs.
         """
         async with self._lock:
+            cleared = 0
             for target_id in list(self._target_errors.keys()):
                 if self._target_errors.get(target_id):
                     self._target_errors[target_id] = None
+                    cleared += 1
             self._last_service_error = None
+        logger.info(
+            "control_plane.clear_all_publication_errors cleared=%d",
+            cleared,
+        )
+        return cleared
 
     async def mark_target_permanent_failure(self, *, target_id: str, reason: str, rt_cd: str | None, msg: str | None, attempts: int | None) -> None:
         resolved = target_id.strip()
@@ -391,17 +404,40 @@ class CollectorControlPlaneService:
             self._session_state = state
             subscribers = list(self._meta_subscribers)
         payload = {"state": state, "observed_at": datetime.utcnow().isoformat()}
+        delivered = 0
+        dropped = 0
         for queue in subscribers:
-            with contextlib.suppress(asyncio.QueueFull):
+            try:
                 queue.put_nowait(("session_state_changed", payload))
+                delivered += 1
+            except asyncio.QueueFull:
+                dropped += 1
+        logger.info(
+            "control_plane.mark_session_state state=%s subscribers=%d delivered=%d dropped=%d",
+            state,
+            len(subscribers),
+            delivered,
+            dropped,
+        )
 
     async def broadcast_session_recovered(self) -> None:
         async with self._lock:
             subscribers = list(self._meta_subscribers)
         payload = {"observed_at": datetime.utcnow().isoformat()}
+        delivered = 0
+        dropped = 0
         for queue in subscribers:
-            with contextlib.suppress(asyncio.QueueFull):
+            try:
                 queue.put_nowait(("session_recovered", payload))
+                delivered += 1
+            except asyncio.QueueFull:
+                dropped += 1
+        logger.info(
+            "control_plane.broadcast_session_recovered subscribers=%d delivered=%d dropped=%d",
+            len(subscribers),
+            delivered,
+            dropped,
+        )
 
     @asynccontextmanager
     async def subscribe_meta_events(self) -> AsyncIterator[asyncio.Queue[tuple[str, dict[str, Any]]]]:
