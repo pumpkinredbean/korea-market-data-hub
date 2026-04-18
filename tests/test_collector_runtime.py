@@ -485,5 +485,55 @@ class SubscribeAckTimeoutWatchdogTests(unittest.IsolatedAsyncioTestCase):
             CollectorRuntime._SUBSCRIBE_ACK_TIMEOUT = original_ack_timeout
 
 
+# ---------------------------------------------------------------------------
+# Logging contract — LogRecord reserved-key regression (H12 Phase 1)
+# ---------------------------------------------------------------------------
+
+
+class PermanentFailureLoggingReservedKeyTests(unittest.IsolatedAsyncioTestCase):
+    """H12 Phase 1 — regression guard against LogRecord reserved-key collisions.
+
+    The permanent-failure logger in ``apps.collector.service`` used to pass an
+    ``extra`` dict whose ``msg`` key clashes with ``logging.LogRecord``'s own
+    ``msg`` attribute, raising ``KeyError: "Attempt to overwrite 'msg' in
+    LogRecord"`` at emit time and skipping the log line entirely. Pin both
+    (a) no exception raised and (b) the "permanently failed" line is captured.
+    """
+
+    async def test_permanent_failure_logging_does_not_raise_on_reserved_key(self) -> None:
+        from apps.collector.service import CollectorDashboardService
+
+        control_plane = SimpleNamespace(
+            mark_target_permanent_failure=mock.AsyncMock(),
+        )
+        service = SimpleNamespace(
+            _control_plane=control_plane,
+        )
+
+        logger_name = "apps.collector.service"
+        with self.assertLogs(logger_name, level=logging.ERROR) as cap:
+            await CollectorDashboardService._handle_runtime_permanent_failure(
+                service,  # type: ignore[arg-type]
+                symbol="000000",
+                market_scope="krx",
+                event_name="trade",
+                owner_ids=("t-perm",),
+                reason="permanent_rt_cd",
+                rt_cd="9001",
+                msg="delisted",
+                attempts=5,
+            )
+
+        control_plane.mark_target_permanent_failure.assert_awaited_once()
+        failure_records = [
+            rec for rec in cap.records if "permanently failed" in rec.getMessage()
+        ]
+        self.assertEqual(len(failure_records), 1, cap.output)
+        rec = failure_records[0]
+        # Reserved key was renamed — extra content is preserved under the
+        # non-colliding attribute name.
+        self.assertEqual(getattr(rec, "failure_msg"), "delisted")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

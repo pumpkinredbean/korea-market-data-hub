@@ -360,7 +360,7 @@ class CollectorDashboardService:
                 "event_name": event_name,
                 "reason": reason,
                 "rt_cd": rt_cd,
-                "msg": msg,
+                "failure_msg": msg,
                 "attempts": attempts,
             },
         )
