@@ -96,10 +96,11 @@ class ProviderRegistryTests(unittest.TestCase):
         self.assertEqual(kxt.adapter_id, "kxt")
         self.assertEqual(ccxt.adapter_id, "ccxt")
         self.assertEqual(ccxt_pro.adapter_id, "ccxt_pro")
-        # Step 1 scope: only KXT is implemented.
+        # Step 2: KXT and CCXT/CCXT Pro are now wired (CCXT Pro provides the
+        # live BinanceLiveAdapter; CCXT REST descriptor stays for the axis).
         self.assertTrue(kxt.implemented)
-        self.assertFalse(ccxt.implemented)
-        self.assertFalse(ccxt_pro.implemented)
+        self.assertTrue(ccxt.implemented)
+        self.assertTrue(ccxt_pro.implemented)
 
 
 class ControlPlaneProviderWiringTests(unittest.IsolatedAsyncioTestCase):
@@ -159,7 +160,7 @@ class ControlPlaneProviderWiringTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RuntimeProviderBranchTests(unittest.IsolatedAsyncioTestCase):
-    async def test_runtime_rejects_non_kxt_provider(self) -> None:
+    async def test_runtime_rejects_unknown_provider(self) -> None:
         from apps.collector.runtime import CollectorRuntime
 
         runtime = CollectorRuntime(SimpleNamespace(app_key="k", app_secret="s"))
@@ -171,11 +172,11 @@ class RuntimeProviderBranchTests(unittest.IsolatedAsyncioTestCase):
 
             with self.assertRaises(NotImplementedError):
                 await runtime.register_target(
-                    owner_id="t-ccxt",
+                    owner_id="t-other",
                     symbol="BTCUSDT",
-                    market_scope="krx",  # ignored by the branch
+                    market_scope="",
                     event_types=("trade",),
-                    provider="ccxt_pro",
+                    provider="other",
                 )
         finally:
             await runtime.aclose()

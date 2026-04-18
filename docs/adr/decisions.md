@@ -44,3 +44,48 @@ impact so later sessions can branch with full context.
     세션의 additive 필드를 소비하는 frontend 작업이 남아 있음.
   - 운영상 추가 DB 스키마 변경이 필요한 시점은 crypto provider의
     subscription persistence가 붙을 때로 지연됨.
+
+---
+
+## H24 — Binance spot + USDT perpetual live adapter (step 2) 결과
+
+- **질문**: Binance spot + USDT perpetual live adapter step2 결과는?
+- **결정**: **PASS** — 최소 라이브 경로(target upsert → provider-aware
+  dispatch → BinanceLiveAdapter subscribe → runtime event publish →
+  control-plane recent event) 가 라이브 데이터로 검증됨.
+- **근거**:
+  - `packages/adapters/ccxt.py`에 step1 skeleton 을 대체하는 실제
+    `BinanceLiveAdapter` 구현. `ccxt.pro` lazy import 기반,
+    spot=`binance` / perpetual=`binanceusdm` 자동 분기.
+    `to_unified_symbol` / `exchange_id_for` 헬퍼로 `BTCUSDT` ↔
+    `BTC/USDT` ↔ `BTC/USDT:USDT` 정규화.
+  - `apps/collector/runtime.py`에 crypto 채널 분기:
+    `_CryptoChannelKey(canonical_symbol, event_name)`,
+    `_acquire_crypto_channel`/`_release_crypto_channel`/
+    `_consume_crypto_channel`. spot/perp BTCUSDT 가 구조적으로 별도
+    채널이며 dedupe 충돌 없음.
+  - `_publish_event` 가 provider/canonical_symbol/instrument_type 을
+    forward (legacy KXT 핸들러는 TypeError fallback).
+  - `apps/collector/service.py`/`publisher.py` 가 provider/
+    canonical/instrument_type 을 envelope 및 control_plane 으로 전달.
+  - `src/collector_control_plane.py`의 `upsert_target` dedupe 가
+    instrument_type 포함, `record_runtime_event` 매칭이
+    canonical_symbol 우선 — spot/perp 트레이드가 정확히 자기 target
+    만 매칭.
+  - 신규 `tests/test_multiprovider_step2_ccxt.py` 8 case 통과,
+    갱신된 step1 9 case + 기존 KXT 17 case 회귀 0 → 총 34 passed.
+  - 라이브 검증: BTC/USDT spot + BTC/USDT:USDT perpetual 양쪽 모두
+    1초 이내 트레이드 수신 확인. End-to-end runtime 경로
+    (`provider=ccxt_pro`, `canonical_symbol=ccxt_pro:binance:spot:BTCUSDT`,
+    `instrument_type=spot`, payload 정상) 라이브 데이터로 PASS.
+  - `/Users/minkyu/workspace/kxt` 변경 0건.
+  - 상세: `reviews/ksxt-migration-progress/multiprovider-binance-live-step2-report.md`
+    (vault).
+- **영향**:
+  - 다음 세션은 (1) **admin UI 통합** —
+    `AdminTargetUpsertRequest`/`DashboardSubscriptionRequest` 에
+    provider/instrument_type 필드 추가, frontend crypto 입력 UI; 또는
+    (2) **capability/event-catalog 완성** — provider×event_type matrix,
+    crypto symbol seed 중 선택. (1) 을 1순위로 권장.
+  - blocker 해소 세션 불필요. KXT/KRX 경로 회귀 없음.
+  - `git push` 금지(H6) 는 H21 미해결 조건으로 그대로 유지.

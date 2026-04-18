@@ -88,19 +88,19 @@ def build_default_registry() -> ProviderRegistry:
     registry.register(
         ProviderRegistration(
             provider=Provider.CCXT,
-            description="CCXT REST provider skeleton (crypto spot/perpetual)",
+            description="CCXT REST provider descriptor (Binance spot/perpetual)",
             factory=build_ccxt_adapter_stub,
             supports_streaming=False,
-            notes="Step 1 skeleton only; streaming belongs to CCXT Pro.",
+            notes="Streaming is served via CCXT Pro adapter; REST sync deferred.",
         )
     )
     registry.register(
         ProviderRegistration(
             provider=Provider.CCXT_PRO,
-            description="CCXT Pro WebSocket provider skeleton (crypto streaming)",
+            description="CCXT Pro live adapter (Binance spot + USDT perpetual)",
             factory=build_ccxt_pro_adapter_stub,
             supports_streaming=True,
-            notes="Step 1 skeleton only; live connectivity deferred.",
+            notes="Backed by BinanceLiveAdapter (binance + binanceusdm).",
         )
     )
     return registry

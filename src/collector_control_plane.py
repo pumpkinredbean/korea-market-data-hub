@@ -209,6 +209,8 @@ class CollectorControlPlaneService:
                 if existing.instrument.symbol == normalized_symbol
                 and existing.market_scope == resolved_market_scope
                 and (existing.provider or Provider.KXT) == resolved_provider
+                and (existing.instrument.instrument_type or InstrumentType.EQUITY)
+                == (resolved_instrument_type or InstrumentType.EQUITY)
             ]
 
         resolved_target_id = requested_target_id or (existing_target_ids[0] if existing_target_ids else uuid.uuid4().hex)
@@ -329,9 +331,14 @@ class CollectorControlPlaneService:
                 target.target_id
                 for target in self._targets.values()
                 if target.enabled
-                and target.instrument.symbol == normalized_symbol
-                and target.market_scope == normalized_market_scope
-                and normalized_event_name in target.event_types
+                and self._target_matches_event(
+                    target,
+                    symbol=normalized_symbol,
+                    market_scope=normalized_market_scope,
+                    event_name=normalized_event_name,
+                    provider=resolved_provider,
+                    canonical_symbol=canonical_symbol,
+                )
             )
             for target_id in matched_target_ids:
                 self._last_event_at_by_target[target_id] = published_at
@@ -722,6 +729,32 @@ class CollectorControlPlaneService:
     def _normalize_event_name(self, event_name: str | None) -> str:
         normalized = str(event_name or "").strip().lower()
         return EVENT_TYPE_ALIASES.get(normalized, normalized)
+
+    @staticmethod
+    def _target_matches_event(
+        target: CollectionTarget,
+        *,
+        symbol: str,
+        market_scope: str,
+        event_name: str,
+        provider: Provider,
+        canonical_symbol: str | None,
+    ) -> bool:
+        if event_name not in target.event_types:
+            return False
+        # Canonical-symbol comparison disambiguates spot vs perpetual on
+        # the same base symbol (e.g. Binance BTCUSDT spot vs USDT-perp).
+        if canonical_symbol and target.canonical_symbol:
+            return canonical_symbol == target.canonical_symbol
+        target_provider = target.provider or Provider.KXT
+        if target_provider != provider:
+            return False
+        if target.instrument.symbol != symbol:
+            return False
+        if target_provider == Provider.KXT:
+            return target.market_scope == market_scope
+        # Non-KXT providers store empty market_scope; symbol+provider is enough.
+        return True
 
     def _normalize_market_scope(self, market_scope: str | None, *, provider: Provider = Provider.KXT) -> str:
         """Normalise KRX selection scope.

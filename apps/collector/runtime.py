@@ -27,7 +27,14 @@ from kxt import (
 )
 
 from packages.contracts import EventType
-from packages.domain.enums import Provider
+from packages.domain.enums import InstrumentType, Provider, Venue
+from packages.adapters.ccxt import (
+    BinanceLiveAdapter,
+    BinanceOrderBookSnapshot,
+    BinanceTrade,
+    to_unified_symbol,
+)
+from packages.domain.models import build_canonical_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +73,7 @@ class RuntimeTargetRegistration:
     event_types: tuple[str, ...]
     provider: Provider = Provider.KXT
     canonical_symbol: str | None = None
+    instrument_type: InstrumentType | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +81,19 @@ class _ChannelKey:
     symbol: str
     market_scope: str
     event_name: str  # trade | order_book_snapshot | program_trade
+
+
+@dataclass(frozen=True, slots=True)
+class _CryptoChannelKey:
+    """Channel key for crypto live channels.
+
+    ``canonical_symbol`` (provider:venue:instrument_type:symbol) keeps
+    spot vs USDT-perpetual BTCUSDT distinct so they cannot collide on
+    dedupe / matching.
+    """
+
+    canonical_symbol: str
+    event_name: str
 
 
 @dataclass(slots=True)
@@ -83,6 +104,16 @@ class _ChannelEntry:
     permanent_failure: bool = False
     events_seen: bool = False
     ack_watchdog: asyncio.Task[None] | None = None
+
+
+@dataclass(slots=True)
+class _CryptoChannelEntry:
+    task: asyncio.Task[None] | None
+    owners: set[str]
+    instrument_type: InstrumentType
+    symbol: str
+    canonical_symbol: str
+    provider: Provider
 
 
 def _decimal_to_float(value: Any) -> float:
@@ -172,6 +203,42 @@ def _format_market_bars(bars: tuple[KSXTMarketBar, ...]) -> list[dict[str, Any]]
     return formatted[-120:]
 
 
+def _format_crypto_trade(event: BinanceTrade) -> tuple[str, dict[str, Any]]:
+    occurred_at = event.occurred_at
+    if occurred_at.tzinfo is None:
+        occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+    payload = {
+        "체결시각": occurred_at.astimezone(timezone.utc).strftime("%H:%M:%S"),
+        "현재가": _number(event.price),
+        "거래량": _number(event.quantity),
+        "side": event.side,
+        "trade_id": event.trade_id,
+        "symbol": event.symbol,
+        "occurred_at": occurred_at.astimezone(timezone.utc).isoformat(),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return "trade_price", payload
+
+
+def _format_crypto_order_book(event: BinanceOrderBookSnapshot) -> tuple[str, dict[str, Any]]:
+    occurred_at = event.occurred_at
+    if occurred_at.tzinfo is None:
+        occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+    payload: dict[str, Any] = {
+        "호가시각": occurred_at.astimezone(timezone.utc).strftime("%H%M%S"),
+        "symbol": event.symbol,
+        "occurred_at": occurred_at.astimezone(timezone.utc).isoformat(),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+    }
+    for index, (price, quantity) in enumerate(event.asks[:10], start=1):
+        payload[f"매도호가{index}"] = _number(price)
+        payload[f"매도잔량{index}"] = _number(quantity)
+    for index, (price, quantity) in enumerate(event.bids[:10], start=1):
+        payload[f"매수호가{index}"] = _number(price)
+        payload[f"매수잔량{index}"] = _number(quantity)
+    return "order_book", payload
+
+
 class CollectorRuntime:
     """Collector-owned live runtime driven by the KSXT ``KISRealtimeSession``.
 
@@ -218,6 +285,8 @@ class CollectorRuntime:
         self._lock = asyncio.Lock()
         self._registrations_by_owner: dict[str, RuntimeTargetRegistration] = {}
         self._channels: dict[_ChannelKey, _ChannelEntry] = {}
+        self._crypto_channels: dict[_CryptoChannelKey, _CryptoChannelEntry] = {}
+        self._crypto_adapter: BinanceLiveAdapter | None = None
         self._closed = False
 
     # ---- lifecycle ------------------------------------------------------
@@ -226,8 +295,12 @@ class CollectorRuntime:
         self._closed = True
         async with self._lock:
             channels = tuple(self._channels.values())
+            crypto_channels = tuple(self._crypto_channels.values())
             self._channels.clear()
+            self._crypto_channels.clear()
             self._registrations_by_owner.clear()
+            crypto_adapter = self._crypto_adapter
+            self._crypto_adapter = None
 
         for entry in channels:
             task = entry.task
@@ -245,6 +318,17 @@ class CollectorRuntime:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
 
+        for crypto_entry in crypto_channels:
+            task = crypto_entry.task
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+
+        if crypto_adapter is not None:
+            with contextlib.suppress(Exception):
+                await crypto_adapter.aclose()
+
         with contextlib.suppress(Exception):
             await self._session.aclose()
         with contextlib.suppress(Exception):
@@ -261,51 +345,156 @@ class CollectorRuntime:
         event_types: tuple[str, ...] | list[str] | None = None,
         provider: str | Provider | None = None,
         canonical_symbol: str | None = None,
+        instrument_type: str | InstrumentType | None = None,
     ) -> RuntimeTargetRegistration:
         normalized_owner_id = owner_id.strip()
         if not normalized_owner_id:
             raise ValueError("owner_id is required")
 
         resolved_provider = self._resolve_provider(provider)
-        if resolved_provider != Provider.KXT:
-            # Step 1 scope: non-KXT providers are wired at the boundary but
-            # their runtime adapter is not yet implemented.  Fail loudly so
-            # the collector never silently accepts a target it cannot serve.
-            raise NotImplementedError(
-                f"runtime adapter for provider={resolved_provider.value} is not wired yet"
+        resolved_instrument_type = self._resolve_instrument_type(instrument_type, provider=resolved_provider)
+        normalized_event_types = self._normalize_event_types(event_types)
+
+        if resolved_provider == Provider.KXT:
+            return await self._register_kxt_target(
+                owner_id=normalized_owner_id,
+                symbol=symbol,
+                market_scope=market_scope,
+                event_types=normalized_event_types,
+                provider=resolved_provider,
+                canonical_symbol=canonical_symbol,
+                instrument_type=resolved_instrument_type,
             )
 
+        if resolved_provider in (Provider.CCXT, Provider.CCXT_PRO):
+            return await self._register_crypto_target(
+                owner_id=normalized_owner_id,
+                symbol=symbol,
+                event_types=normalized_event_types,
+                provider=resolved_provider,
+                canonical_symbol=canonical_symbol,
+                instrument_type=resolved_instrument_type,
+            )
+
+        raise NotImplementedError(
+            f"runtime adapter for provider={resolved_provider.value} is not wired yet"
+        )
+
+    async def _register_kxt_target(
+        self,
+        *,
+        owner_id: str,
+        symbol: str,
+        market_scope: str,
+        event_types: tuple[str, ...],
+        provider: Provider,
+        canonical_symbol: str | None,
+        instrument_type: InstrumentType | None,
+    ) -> RuntimeTargetRegistration:
         stream_key = self._build_stream_key(symbol=symbol, market_scope=market_scope)
-        normalized_event_types = self._normalize_event_types(event_types)
         registration = RuntimeTargetRegistration(
-            owner_id=normalized_owner_id,
+            owner_id=owner_id,
             stream_key=stream_key,
-            event_types=normalized_event_types,
-            provider=resolved_provider,
+            event_types=event_types,
+            provider=provider,
             canonical_symbol=canonical_symbol,
+            instrument_type=instrument_type,
         )
 
         await self._wait_session_ready(timeout=self._SESSION_READY_TIMEOUT)
 
-        # Snapshot previous registration (if any) and compute diffs outside
-        # the channel-lock so we can safely invoke async KSXT ops.
         async with self._lock:
-            previous = self._registrations_by_owner.get(normalized_owner_id)
-            self._registrations_by_owner[normalized_owner_id] = registration
+            previous = self._registrations_by_owner.get(owner_id)
+            self._registrations_by_owner[owner_id] = registration
 
             previous_channels = (
                 {_ChannelKey(stream_key.symbol, stream_key.market_scope, ev) for ev in previous.event_types}
-                if previous is not None
+                if previous is not None and previous.provider == Provider.KXT
                 else set()
             )
-            new_channels = {_ChannelKey(stream_key.symbol, stream_key.market_scope, ev) for ev in normalized_event_types}
+            new_channels = {_ChannelKey(stream_key.symbol, stream_key.market_scope, ev) for ev in event_types}
             to_add = new_channels - previous_channels
             to_remove = previous_channels - new_channels
 
         for channel_key in to_add:
-            await self._acquire_channel(channel_key, owner_id=normalized_owner_id)
+            await self._acquire_channel(channel_key, owner_id=owner_id)
         for channel_key in to_remove:
-            await self._release_channel(channel_key, owner_id=normalized_owner_id)
+            await self._release_channel(channel_key, owner_id=owner_id)
+
+        return registration
+
+    async def _register_crypto_target(
+        self,
+        *,
+        owner_id: str,
+        symbol: str,
+        event_types: tuple[str, ...],
+        provider: Provider,
+        canonical_symbol: str | None,
+        instrument_type: InstrumentType | None,
+    ) -> RuntimeTargetRegistration:
+        normalized_symbol = symbol.strip()
+        if not normalized_symbol:
+            raise ValueError("symbol is required")
+
+        resolved_instrument_type = instrument_type or InstrumentType.SPOT
+        if resolved_instrument_type not in (InstrumentType.SPOT, InstrumentType.PERPETUAL):
+            raise ValueError(
+                f"unsupported crypto instrument_type: {resolved_instrument_type.value}"
+            )
+
+        resolved_canonical = canonical_symbol or build_canonical_symbol(
+            provider=provider,
+            venue=Venue.BINANCE,
+            instrument_type=resolved_instrument_type,
+            symbol=normalized_symbol,
+        )
+
+        # Crypto targets do not carry a KRX market_scope; use the empty scope
+        # so dashboard plumbing receives a not-applicable signal.
+        stream_key = DashboardStreamKey(symbol=normalized_symbol, market_scope="")
+        registration = RuntimeTargetRegistration(
+            owner_id=owner_id,
+            stream_key=stream_key,
+            event_types=event_types,
+            provider=provider,
+            canonical_symbol=resolved_canonical,
+            instrument_type=resolved_instrument_type,
+        )
+
+        async with self._lock:
+            previous = self._registrations_by_owner.get(owner_id)
+            self._registrations_by_owner[owner_id] = registration
+
+            previous_channels: set[_CryptoChannelKey] = set()
+            if previous is not None and previous.provider in (Provider.CCXT, Provider.CCXT_PRO):
+                previous_canonical = previous.canonical_symbol or build_canonical_symbol(
+                    provider=previous.provider,
+                    venue=Venue.BINANCE,
+                    instrument_type=previous.instrument_type or InstrumentType.SPOT,
+                    symbol=previous.stream_key.symbol,
+                )
+                previous_channels = {
+                    _CryptoChannelKey(canonical_symbol=previous_canonical, event_name=ev)
+                    for ev in previous.event_types
+                }
+            new_channels = {
+                _CryptoChannelKey(canonical_symbol=resolved_canonical, event_name=ev)
+                for ev in event_types
+            }
+            to_add = new_channels - previous_channels
+            to_remove = previous_channels - new_channels
+
+        for channel_key in to_add:
+            await self._acquire_crypto_channel(
+                channel_key,
+                owner_id=owner_id,
+                provider=provider,
+                instrument_type=resolved_instrument_type,
+                symbol=normalized_symbol,
+            )
+        for channel_key in to_remove:
+            await self._release_crypto_channel(channel_key, owner_id=owner_id)
 
         return registration
 
@@ -313,16 +502,29 @@ class CollectorRuntime:
         normalized_owner_id = owner_id.strip()
         async with self._lock:
             registration = self._registrations_by_owner.pop(normalized_owner_id, None)
-            to_release = (
-                {
-                    _ChannelKey(registration.stream_key.symbol, registration.stream_key.market_scope, ev)
-                    for ev in registration.event_types
-                }
-                if registration is not None
-                else set()
-            )
-        for channel_key in to_release:
+            kxt_to_release: set[_ChannelKey] = set()
+            crypto_to_release: set[_CryptoChannelKey] = set()
+            if registration is not None:
+                if registration.provider == Provider.KXT:
+                    kxt_to_release = {
+                        _ChannelKey(registration.stream_key.symbol, registration.stream_key.market_scope, ev)
+                        for ev in registration.event_types
+                    }
+                elif registration.provider in (Provider.CCXT, Provider.CCXT_PRO):
+                    canonical = registration.canonical_symbol or build_canonical_symbol(
+                        provider=registration.provider,
+                        venue=Venue.BINANCE,
+                        instrument_type=registration.instrument_type or InstrumentType.SPOT,
+                        symbol=registration.stream_key.symbol,
+                    )
+                    crypto_to_release = {
+                        _CryptoChannelKey(canonical_symbol=canonical, event_name=ev)
+                        for ev in registration.event_types
+                    }
+        for channel_key in kxt_to_release:
             await self._release_channel(channel_key, owner_id=normalized_owner_id)
+        for channel_key in crypto_to_release:
+            await self._release_crypto_channel(channel_key, owner_id=normalized_owner_id)
         return registration
 
     def is_target_active(self, owner_id: str) -> bool:
@@ -506,6 +708,146 @@ class CollectorRuntime:
             logger.exception("subscription consumer crashed: %s", channel_key)
             await self._dispatch_failure(channel_key, error=str(exc))
 
+    # ---- crypto channel management -------------------------------------
+
+    def _ensure_crypto_adapter(self) -> BinanceLiveAdapter:
+        if self._crypto_adapter is None:
+            self._crypto_adapter = BinanceLiveAdapter()
+        return self._crypto_adapter
+
+    async def _acquire_crypto_channel(
+        self,
+        channel_key: _CryptoChannelKey,
+        *,
+        owner_id: str,
+        provider: Provider,
+        instrument_type: InstrumentType,
+        symbol: str,
+    ) -> None:
+        async with self._lock:
+            entry = self._crypto_channels.get(channel_key)
+            if entry is not None:
+                entry.owners.add(owner_id)
+                already_running = entry.task is not None
+            else:
+                entry = _CryptoChannelEntry(
+                    task=None,
+                    owners={owner_id},
+                    instrument_type=instrument_type,
+                    symbol=symbol,
+                    canonical_symbol=channel_key.canonical_symbol,
+                    provider=provider,
+                )
+                self._crypto_channels[channel_key] = entry
+                already_running = False
+
+        if already_running:
+            return
+
+        if channel_key.event_name == _EVENT_TRADE:
+            stream_factory = self._crypto_trade_stream
+        elif channel_key.event_name == _EVENT_ORDER_BOOK:
+            stream_factory = self._crypto_order_book_stream
+        else:
+            logger.warning(
+                "crypto provider does not support event_type=%s; skipping",
+                channel_key.event_name,
+            )
+            async with self._lock:
+                self._crypto_channels.pop(channel_key, None)
+            return
+
+        adapter = self._ensure_crypto_adapter()
+        task = asyncio.create_task(
+            self._consume_crypto_channel(
+                channel_key,
+                adapter=adapter,
+                stream_factory=stream_factory,
+                provider=provider,
+                instrument_type=instrument_type,
+                symbol=symbol,
+            ),
+            name=f"ccxt-pro-{channel_key.canonical_symbol}-{channel_key.event_name}",
+        )
+        async with self._lock:
+            entry = self._crypto_channels.get(channel_key)
+            if entry is not None:
+                entry.task = task
+        logger.info(
+            "ccxt.pro subscribe symbol=%s instrument_type=%s event=%s canonical=%s",
+            symbol,
+            instrument_type.value,
+            channel_key.event_name,
+            channel_key.canonical_symbol,
+        )
+
+    async def _release_crypto_channel(
+        self,
+        channel_key: _CryptoChannelKey,
+        *,
+        owner_id: str,
+    ) -> None:
+        async with self._lock:
+            entry = self._crypto_channels.get(channel_key)
+            if entry is None:
+                return
+            entry.owners.discard(owner_id)
+            if entry.owners:
+                return
+            self._crypto_channels.pop(channel_key, None)
+            task = entry.task
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+    def _crypto_trade_stream(self, adapter: BinanceLiveAdapter, *, symbol: str, instrument_type: InstrumentType):
+        return adapter.stream_trades(symbol=symbol, instrument_type=instrument_type)
+
+    def _crypto_order_book_stream(self, adapter: BinanceLiveAdapter, *, symbol: str, instrument_type: InstrumentType):
+        return adapter.stream_order_book_snapshots(symbol=symbol, instrument_type=instrument_type)
+
+    async def _consume_crypto_channel(
+        self,
+        channel_key: _CryptoChannelKey,
+        *,
+        adapter: BinanceLiveAdapter,
+        stream_factory,
+        provider: Provider,
+        instrument_type: InstrumentType,
+        symbol: str,
+    ) -> None:
+        try:
+            async for event in stream_factory(adapter, symbol=symbol, instrument_type=instrument_type):
+                if isinstance(event, BinanceTrade):
+                    published_event_name, payload = _format_crypto_trade(event)
+                    canonical_event_name = _EVENT_TRADE
+                elif isinstance(event, BinanceOrderBookSnapshot):
+                    published_event_name, payload = _format_crypto_order_book(event)
+                    canonical_event_name = _EVENT_ORDER_BOOK
+                else:
+                    logger.debug("dropping unknown crypto event type: %r", type(event))
+                    continue
+                if canonical_event_name != channel_key.event_name:
+                    continue
+                await self._publish_event(
+                    symbol=symbol,
+                    market_scope="",
+                    event_name=published_event_name,
+                    payload=payload,
+                    provider=provider.value,
+                    canonical_symbol=channel_key.canonical_symbol,
+                    instrument_type=instrument_type.value,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("crypto subscription consumer crashed: %s", channel_key)
+            await self._dispatch_failure(
+                _ChannelKey(symbol=symbol, market_scope="", event_name=channel_key.event_name),
+                error=str(exc),
+            )
+
     # ---- session-level callbacks ---------------------------------------
 
     async def _watch_subscription_ack(self, channel_key: _ChannelKey) -> None:
@@ -598,7 +940,17 @@ class CollectorRuntime:
 
     # ---- dispatch helpers ----------------------------------------------
 
-    async def _publish_event(self, *, symbol: str, market_scope: str, event_name: str, payload: dict[str, Any]) -> None:
+    async def _publish_event(
+        self,
+        *,
+        symbol: str,
+        market_scope: str,
+        event_name: str,
+        payload: dict[str, Any],
+        provider: str | None = None,
+        canonical_symbol: str | None = None,
+        instrument_type: str | None = None,
+    ) -> None:
         if self._on_event is None:
             return
         try:
@@ -607,7 +959,22 @@ class CollectorRuntime:
                 market_scope=market_scope,
                 event_name=event_name,
                 payload=payload,
+                provider=provider,
+                canonical_symbol=canonical_symbol,
+                instrument_type=instrument_type,
             )
+        except TypeError:
+            # Backwards-compat: legacy on_event handlers (KXT-only) accept
+            # only (symbol, market_scope, event_name, payload).
+            try:
+                await self._on_event(
+                    symbol=symbol,
+                    market_scope=market_scope,
+                    event_name=event_name,
+                    payload=payload,
+                )
+            except Exception:
+                logger.exception("on_event handler failed for %s/%s", symbol, event_name)
         except Exception:
             logger.exception("on_event handler failed for %s/%s", symbol, event_name)
 
@@ -672,6 +1039,25 @@ class CollectorRuntime:
             return Provider(str(provider).strip().lower())
         except ValueError as exc:
             raise ValueError(f"unsupported provider: {provider}") from exc
+
+    @staticmethod
+    def _resolve_instrument_type(
+        instrument_type: str | InstrumentType | None,
+        *,
+        provider: Provider,
+    ) -> InstrumentType | None:
+        if instrument_type is None or instrument_type == "":
+            if provider == Provider.KXT:
+                return InstrumentType.EQUITY
+            if provider in (Provider.CCXT, Provider.CCXT_PRO):
+                return InstrumentType.SPOT
+            return None
+        if isinstance(instrument_type, InstrumentType):
+            return instrument_type
+        try:
+            return InstrumentType(str(instrument_type).strip().lower())
+        except ValueError as exc:
+            raise ValueError(f"unsupported instrument_type: {instrument_type}") from exc
 
     def _normalize_event_types(self, event_types: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
         if event_types is None:

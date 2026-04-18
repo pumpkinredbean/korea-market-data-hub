@@ -181,27 +181,44 @@ class CollectorDashboardService:
         instrument_type: str | None = None,
         canonical_symbol: str | None = None,
     ) -> dict[str, Any]:
-        subscription = self._build_subscription(symbol=symbol, market_scope=market_scope)
+        resolved_provider = provider if isinstance(provider, Provider) else (
+            Provider(provider.strip().lower()) if isinstance(provider, str) and provider.strip() else Provider.KXT
+        )
+        resolved_market_scope = market_scope.strip().lower() if market_scope else ""
+        if resolved_provider == Provider.KXT:
+            subscription = self._build_subscription(symbol=symbol, market_scope=resolved_market_scope)
+            symbol_value = subscription.symbol
+            scope_value = subscription.market_scope
+            subscription_key = subscription.subscription_key
+        else:
+            symbol_value = symbol.strip()
+            if not symbol_value:
+                raise ValueError("symbol is required")
+            scope_value = ""
+            subscription_key = f"dashboard:{resolved_provider.value}:{instrument_type or 'spot'}:{symbol_value}"
+
         resolved_owner_id = owner_id or uuid.uuid4().hex
 
         await self._collector_runtime.register_target(
             owner_id=resolved_owner_id,
-            symbol=subscription.symbol,
-            market_scope=subscription.market_scope,
+            symbol=symbol_value,
+            market_scope=scope_value,
             event_types=event_types or _all_dashboard_event_types(),
-            provider=provider,
+            provider=resolved_provider,
             canonical_symbol=canonical_symbol,
+            instrument_type=instrument_type,
         )
 
         async with self._lock:
-            self._owner_index[resolved_owner_id] = subscription.subscription_key
+            self._owner_index[resolved_owner_id] = subscription_key
 
         return {
             "subscription_id": resolved_owner_id,
-            "symbol": subscription.symbol,
-            "market_scope": subscription.market_scope,
-            "market": subscription.market_scope,
-            "provider": (provider or Provider.KXT.value) if isinstance(provider, str) else (provider.value if provider else Provider.KXT.value),
+            "symbol": symbol_value,
+            "market_scope": scope_value,
+            "market": scope_value,
+            "provider": resolved_provider.value,
+            "instrument_type": instrument_type,
             "canonical_symbol": canonical_symbol,
             "status": "started",
         }
@@ -310,18 +327,32 @@ class CollectorDashboardService:
 
         await self.stop_dashboard_publication(subscription_id=owner_id)
 
-    async def _handle_runtime_event(self, *, symbol: str, market_scope: str, event_name: str, payload: dict[str, Any]) -> None:
+    async def _handle_runtime_event(
+        self,
+        *,
+        symbol: str,
+        market_scope: str,
+        event_name: str,
+        payload: dict[str, Any],
+        provider: str | None = None,
+        canonical_symbol: str | None = None,
+        instrument_type: str | None = None,
+    ) -> None:
         await self._publisher.publish_dashboard_event(
             symbol=symbol,
             market_scope=market_scope,
             event_name=event_name,
             payload=payload,
+            provider=provider,
+            canonical_symbol=canonical_symbol,
         )
         await self._control_plane.record_runtime_event(
             symbol=symbol,
             market_scope=market_scope,
             event_name=event_name,
             payload=payload,
+            provider=provider,
+            canonical_symbol=canonical_symbol,
         )
 
     async def _handle_runtime_failure(self, *, symbol: str, market_scope: str, error: str) -> None:
