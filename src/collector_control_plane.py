@@ -141,8 +141,11 @@ EVENT_TYPE_ALIASES: dict[str, str] = {
     "ohlcv": "ohlcv",
     "candle": "ohlcv",
     "mark_price": "mark_price",
+    "mark": "mark_price",
     "funding_rate": "funding_rate",
+    "funding": "funding_rate",
     "open_interest": "open_interest",
+    "oi": "open_interest",
 }
 
 EVENT_TYPE_DESCRIPTIONS: dict[EventType, str] = {
@@ -152,8 +155,8 @@ EVENT_TYPE_DESCRIPTIONS: dict[EventType, str] = {
     EventType.TICKER: "심볼 단위 시세 요약 (best bid/ask + last)",
     EventType.OHLCV: "OHLCV 캔들/바 이벤트",
     EventType.MARK_PRICE: "선물/무기한 마크 프라이스",
-    EventType.FUNDING_RATE: "무기한 펀딩비",
-    EventType.OPEN_INTEREST: "선물/무기한 미결제약정",
+    EventType.FUNDING_RATE: "무기한 펀딩비 (polled every ~30s, near-live)",
+    EventType.OPEN_INTEREST: "선물/무기한 미결제약정 (polled every ~30s, near-live)",
 }
 
 BOOTSTRAP_INSTRUMENTS: tuple[tuple[str, str], ...] = (

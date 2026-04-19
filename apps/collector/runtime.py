@@ -38,8 +38,13 @@ else:
 from packages.contracts import EventType
 from packages.domain.enums import AssetClass, InstrumentType, Provider, Venue, external_provider_value
 from packages.adapters.ccxt import (
+    BinanceBar,
+    BinanceFundingRate,
     BinanceLiveAdapter,
+    BinanceMarkPrice,
+    BinanceOpenInterest,
     BinanceOrderBookSnapshot,
+    BinanceTicker,
     BinanceTrade,
     to_unified_symbol,
 )
@@ -54,6 +59,11 @@ SUPPORTED_MARKET_SCOPES = {"krx", "nxt", "total"}
 _EVENT_TRADE = EventType.TRADE.value
 _EVENT_ORDER_BOOK = EventType.ORDER_BOOK_SNAPSHOT.value
 _EVENT_PROGRAM_TRADE = EventType.PROGRAM_TRADE.value
+_EVENT_TICKER = EventType.TICKER.value
+_EVENT_OHLCV = EventType.OHLCV.value
+_EVENT_MARK_PRICE = EventType.MARK_PRICE.value
+_EVENT_FUNDING_RATE = EventType.FUNDING_RATE.value
+_EVENT_OPEN_INTEREST = EventType.OPEN_INTEREST.value
 
 # Map admin event names to KSXT StreamKind.  ``program_trade`` is not exposed by
 # the KSXT realtime session (only trades + order_book).  Targets requesting
@@ -247,6 +257,85 @@ def _format_crypto_order_book(event: BinanceOrderBookSnapshot) -> tuple[str, dic
         payload[f"매수호가{index}"] = _number(price)
         payload[f"매수잔량{index}"] = _number(quantity)
     return "order_book", payload
+
+
+def _utc_iso(event_dt: datetime) -> str:
+    if event_dt.tzinfo is None:
+        event_dt = event_dt.replace(tzinfo=timezone.utc)
+    return event_dt.astimezone(timezone.utc).isoformat()
+
+
+def _format_crypto_ticker(event: BinanceTicker) -> tuple[str, dict[str, Any]]:
+    payload = {
+        "symbol": event.symbol,
+        "instrument_type": event.instrument_type,
+        "occurred_at": _utc_iso(event.occurred_at),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "last": _number(event.last),
+        "bid": _number(event.bid),
+        "ask": _number(event.ask),
+        "bid_size": _number(event.bid_size),
+        "ask_size": _number(event.ask_size),
+        "high": _number(event.high),
+        "low": _number(event.low),
+        "base_volume": _number(event.base_volume),
+        "quote_volume": _number(event.quote_volume),
+    }
+    return _EVENT_TICKER, payload
+
+
+def _format_crypto_bar(event: BinanceBar) -> tuple[str, dict[str, Any]]:
+    payload = {
+        "symbol": event.symbol,
+        "instrument_type": event.instrument_type,
+        "timeframe": event.timeframe,
+        "open_time_ms": event.open_time_ms,
+        "occurred_at": _utc_iso(event.occurred_at),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "open": _number(event.open),
+        "high": _number(event.high),
+        "low": _number(event.low),
+        "close": _number(event.close),
+        "volume": _number(event.volume),
+    }
+    return _EVENT_OHLCV, payload
+
+
+def _format_crypto_mark_price(event: BinanceMarkPrice) -> tuple[str, dict[str, Any]]:
+    payload = {
+        "symbol": event.symbol,
+        "instrument_type": event.instrument_type,
+        "occurred_at": _utc_iso(event.occurred_at),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "mark_price": _number(event.mark_price),
+        "index_price": _number(event.index_price),
+    }
+    return _EVENT_MARK_PRICE, payload
+
+
+def _format_crypto_funding_rate(event: BinanceFundingRate) -> tuple[str, dict[str, Any]]:
+    payload = {
+        "symbol": event.symbol,
+        "instrument_type": event.instrument_type,
+        "occurred_at": _utc_iso(event.occurred_at),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "funding_rate": _number(event.funding_rate),
+        "funding_timestamp_ms": event.funding_timestamp_ms,
+        "next_funding_timestamp_ms": event.next_funding_timestamp_ms,
+    }
+    return _EVENT_FUNDING_RATE, payload
+
+
+def _format_crypto_open_interest(event: BinanceOpenInterest) -> tuple[str, dict[str, Any]]:
+    payload = {
+        "symbol": event.symbol,
+        "instrument_type": event.instrument_type,
+        "occurred_at": _utc_iso(event.occurred_at),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "open_interest_amount": _number(event.open_interest_amount),
+        "open_interest_value": _number(event.open_interest_value),
+    }
+    return _EVENT_OPEN_INTEREST, payload
 
 
 class CollectorRuntime:
@@ -787,6 +876,43 @@ class CollectorRuntime:
             stream_factory = self._crypto_trade_stream
         elif channel_key.event_name == _EVENT_ORDER_BOOK:
             stream_factory = self._crypto_order_book_stream
+        elif channel_key.event_name == _EVENT_TICKER:
+            stream_factory = self._crypto_ticker_stream
+        elif channel_key.event_name == _EVENT_OHLCV:
+            stream_factory = self._crypto_ohlcv_stream
+        elif channel_key.event_name == _EVENT_MARK_PRICE:
+            if instrument_type != InstrumentType.PERPETUAL:
+                logger.warning(
+                    "crypto event_type=%s requires perpetual; skipping (instrument_type=%s)",
+                    channel_key.event_name,
+                    instrument_type.value,
+                )
+                async with self._lock:
+                    self._crypto_channels.pop(channel_key, None)
+                return
+            stream_factory = self._crypto_mark_price_stream
+        elif channel_key.event_name == _EVENT_FUNDING_RATE:
+            if instrument_type != InstrumentType.PERPETUAL:
+                logger.warning(
+                    "crypto event_type=%s requires perpetual; skipping (instrument_type=%s)",
+                    channel_key.event_name,
+                    instrument_type.value,
+                )
+                async with self._lock:
+                    self._crypto_channels.pop(channel_key, None)
+                return
+            stream_factory = self._crypto_funding_rate_stream
+        elif channel_key.event_name == _EVENT_OPEN_INTEREST:
+            if instrument_type != InstrumentType.PERPETUAL:
+                logger.warning(
+                    "crypto event_type=%s requires perpetual; skipping (instrument_type=%s)",
+                    channel_key.event_name,
+                    instrument_type.value,
+                )
+                async with self._lock:
+                    self._crypto_channels.pop(channel_key, None)
+                return
+            stream_factory = self._crypto_open_interest_stream
         else:
             logger.warning(
                 "crypto provider does not support event_type=%s; skipping",
@@ -846,6 +972,21 @@ class CollectorRuntime:
     def _crypto_order_book_stream(self, adapter: BinanceLiveAdapter, *, symbol: str, instrument_type: InstrumentType):
         return adapter.stream_order_book_snapshots(symbol=symbol, instrument_type=instrument_type)
 
+    def _crypto_ticker_stream(self, adapter: BinanceLiveAdapter, *, symbol: str, instrument_type: InstrumentType):
+        return adapter.stream_tickers(symbol=symbol, instrument_type=instrument_type)
+
+    def _crypto_ohlcv_stream(self, adapter: BinanceLiveAdapter, *, symbol: str, instrument_type: InstrumentType):
+        return adapter.stream_ohlcv(symbol=symbol, instrument_type=instrument_type)
+
+    def _crypto_mark_price_stream(self, adapter: BinanceLiveAdapter, *, symbol: str, instrument_type: InstrumentType):
+        return adapter.stream_mark_price(symbol=symbol, instrument_type=instrument_type)
+
+    def _crypto_funding_rate_stream(self, adapter: BinanceLiveAdapter, *, symbol: str, instrument_type: InstrumentType):
+        return adapter.poll_funding_rate(symbol=symbol, instrument_type=instrument_type)
+
+    def _crypto_open_interest_stream(self, adapter: BinanceLiveAdapter, *, symbol: str, instrument_type: InstrumentType):
+        return adapter.poll_open_interest(symbol=symbol, instrument_type=instrument_type)
+
     async def _consume_crypto_channel(
         self,
         channel_key: _CryptoChannelKey,
@@ -864,6 +1005,21 @@ class CollectorRuntime:
                 elif isinstance(event, BinanceOrderBookSnapshot):
                     published_event_name, payload = _format_crypto_order_book(event)
                     canonical_event_name = _EVENT_ORDER_BOOK
+                elif isinstance(event, BinanceTicker):
+                    published_event_name, payload = _format_crypto_ticker(event)
+                    canonical_event_name = _EVENT_TICKER
+                elif isinstance(event, BinanceBar):
+                    published_event_name, payload = _format_crypto_bar(event)
+                    canonical_event_name = _EVENT_OHLCV
+                elif isinstance(event, BinanceMarkPrice):
+                    published_event_name, payload = _format_crypto_mark_price(event)
+                    canonical_event_name = _EVENT_MARK_PRICE
+                elif isinstance(event, BinanceFundingRate):
+                    published_event_name, payload = _format_crypto_funding_rate(event)
+                    canonical_event_name = _EVENT_FUNDING_RATE
+                elif isinstance(event, BinanceOpenInterest):
+                    published_event_name, payload = _format_crypto_open_interest(event)
+                    canonical_event_name = _EVENT_OPEN_INTEREST
                 else:
                     logger.debug("dropping unknown crypto event type: %r", type(event))
                     continue

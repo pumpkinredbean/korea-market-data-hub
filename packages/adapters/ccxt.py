@@ -202,6 +202,74 @@ class BinanceOrderBookSnapshot:
     bids: tuple[tuple[Decimal, Decimal], ...]
 
 
+@dataclass(frozen=True, slots=True)
+class BinanceTicker:
+    """Lean ticker payload returned by :meth:`BinanceLiveAdapter.stream_tickers`."""
+
+    symbol: str
+    instrument_type: str
+    occurred_at: datetime
+    last: Decimal | None
+    bid: Decimal | None
+    ask: Decimal | None
+    bid_size: Decimal | None
+    ask_size: Decimal | None
+    high: Decimal | None
+    low: Decimal | None
+    base_volume: Decimal | None
+    quote_volume: Decimal | None
+
+
+@dataclass(frozen=True, slots=True)
+class BinanceBar:
+    """Lean OHLCV bar payload returned by :meth:`BinanceLiveAdapter.stream_ohlcv`."""
+
+    symbol: str
+    instrument_type: str
+    timeframe: str
+    open_time_ms: int
+    occurred_at: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class BinanceMarkPrice:
+    """Perpetual mark-price payload returned by :meth:`BinanceLiveAdapter.stream_mark_price`."""
+
+    symbol: str
+    instrument_type: str
+    occurred_at: datetime
+    mark_price: Decimal | None
+    index_price: Decimal | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BinanceFundingRate:
+    """Perpetual funding-rate payload from :meth:`BinanceLiveAdapter.poll_funding_rate`."""
+
+    symbol: str
+    instrument_type: str
+    occurred_at: datetime
+    funding_rate: Decimal | None
+    funding_timestamp_ms: int | None = None
+    next_funding_timestamp_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BinanceOpenInterest:
+    """Perpetual open-interest payload from :meth:`BinanceLiveAdapter.poll_open_interest`."""
+
+    symbol: str
+    instrument_type: str
+    occurred_at: datetime
+    open_interest_amount: Decimal | None
+    open_interest_value: Decimal | None = None
+
+
 class BinanceLiveAdapter:
     """Minimal real CCXT Pro adapter for Binance spot + USDT perpetual.
 
@@ -289,6 +357,132 @@ class BinanceLiveAdapter:
                 continue
             yield _parse_ccxt_order_book(unified, book, limit)
 
+    async def stream_tickers(
+        self,
+        *,
+        symbol: str,
+        instrument_type: InstrumentType | str | None = InstrumentType.SPOT,
+    ) -> AsyncIterator[BinanceTicker]:
+        unified = to_unified_symbol(symbol, instrument_type)
+        exchange = await self._exchange(instrument_type)
+        it_value = _instrument_type_value(instrument_type)
+        while not self._closed:
+            try:
+                raw = await exchange.watch_ticker(unified)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("watch_ticker failed for %s", unified)
+                await asyncio.sleep(1.0)
+                continue
+            if raw is None:
+                continue
+            yield _parse_ccxt_ticker(unified, it_value, raw)
+
+    async def stream_ohlcv(
+        self,
+        *,
+        symbol: str,
+        instrument_type: InstrumentType | str | None = InstrumentType.SPOT,
+        timeframe: str = "1m",
+    ) -> AsyncIterator[BinanceBar]:
+        unified = to_unified_symbol(symbol, instrument_type)
+        exchange = await self._exchange(instrument_type)
+        it_value = _instrument_type_value(instrument_type)
+        while not self._closed:
+            try:
+                bars = await exchange.watchOHLCV(unified, timeframe)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("watchOHLCV failed for %s (%s)", unified, timeframe)
+                await asyncio.sleep(1.0)
+                continue
+            if not bars:
+                continue
+            latest = bars[-1]
+            yield _parse_ccxt_ohlcv_bar(unified, it_value, timeframe, latest)
+
+    async def stream_mark_price(
+        self,
+        *,
+        symbol: str,
+        instrument_type: InstrumentType | str | None = InstrumentType.PERPETUAL,
+    ) -> AsyncIterator[BinanceMarkPrice]:
+        it_value = _instrument_type_value(instrument_type)
+        if it_value != "perpetual":
+            raise ValueError("stream_mark_price requires instrument_type='perpetual'")
+        unified = to_unified_symbol(symbol, instrument_type)
+        exchange = await self._exchange(instrument_type)
+        while not self._closed:
+            try:
+                raw = await exchange.watch_mark_price(unified)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("watch_mark_price failed for %s", unified)
+                await asyncio.sleep(1.0)
+                continue
+            if raw is None:
+                continue
+            yield _parse_ccxt_mark_price(unified, it_value, raw)
+
+    async def poll_funding_rate(
+        self,
+        *,
+        symbol: str,
+        instrument_type: InstrumentType | str | None = InstrumentType.PERPETUAL,
+        interval: float = 30.0,
+    ) -> AsyncIterator[BinanceFundingRate]:
+        it_value = _instrument_type_value(instrument_type)
+        if it_value != "perpetual":
+            raise ValueError("poll_funding_rate requires instrument_type='perpetual'")
+        unified = to_unified_symbol(symbol, instrument_type)
+        exchange = await self._exchange(instrument_type)
+        while not self._closed:
+            try:
+                raw = await exchange.fetch_funding_rate(unified)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("fetch_funding_rate failed for %s", unified)
+                await asyncio.sleep(interval)
+                continue
+            if raw is not None:
+                yield _parse_ccxt_funding_rate(unified, it_value, raw)
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
+
+    async def poll_open_interest(
+        self,
+        *,
+        symbol: str,
+        instrument_type: InstrumentType | str | None = InstrumentType.PERPETUAL,
+        interval: float = 30.0,
+    ) -> AsyncIterator[BinanceOpenInterest]:
+        it_value = _instrument_type_value(instrument_type)
+        if it_value != "perpetual":
+            raise ValueError("poll_open_interest requires instrument_type='perpetual'")
+        unified = to_unified_symbol(symbol, instrument_type)
+        exchange = await self._exchange(instrument_type)
+        while not self._closed:
+            try:
+                raw = await exchange.fetch_open_interest(unified)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("fetch_open_interest failed for %s", unified)
+                await asyncio.sleep(interval)
+                continue
+            if raw is not None:
+                yield _parse_ccxt_open_interest(unified, it_value, raw)
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
+
 
 def _parse_ccxt_trade(symbol: str, raw: dict[str, Any]) -> BinanceTrade:
     timestamp_ms = raw.get("timestamp")
@@ -337,3 +531,136 @@ def _parse_ccxt_order_book(symbol: str, raw: dict[str, Any], limit: int) -> Bina
 
 def build_binance_live_adapter() -> BinanceLiveAdapter:
     return BinanceLiveAdapter()
+
+
+def _instrument_type_value(instrument_type: InstrumentType | str | None) -> str:
+    if isinstance(instrument_type, InstrumentType):
+        return instrument_type.value
+    return str(instrument_type or "spot").strip().lower() or "spot"
+
+
+def _to_decimal(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _timestamp_to_datetime(timestamp_ms: Any) -> datetime:
+    if isinstance(timestamp_ms, (int, float)) and timestamp_ms > 0:
+        return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
+    return datetime.now(tz=timezone.utc)
+
+
+def _parse_ccxt_ticker(symbol: str, instrument_type: str, raw: dict[str, Any]) -> BinanceTicker:
+    occurred_at = _timestamp_to_datetime(raw.get("timestamp"))
+    return BinanceTicker(
+        symbol=symbol,
+        instrument_type=instrument_type,
+        occurred_at=occurred_at,
+        last=_to_decimal(raw.get("last") if raw.get("last") is not None else raw.get("close")),
+        bid=_to_decimal(raw.get("bid")),
+        ask=_to_decimal(raw.get("ask")),
+        bid_size=_to_decimal(raw.get("bidVolume")),
+        ask_size=_to_decimal(raw.get("askVolume")),
+        high=_to_decimal(raw.get("high")),
+        low=_to_decimal(raw.get("low")),
+        base_volume=_to_decimal(raw.get("baseVolume")),
+        quote_volume=_to_decimal(raw.get("quoteVolume")),
+    )
+
+
+def _parse_ccxt_ohlcv_bar(
+    symbol: str,
+    instrument_type: str,
+    timeframe: str,
+    raw: list[Any] | tuple[Any, ...],
+) -> BinanceBar:
+    # ccxt OHLCV format: [timestamp_ms, open, high, low, close, volume]
+    open_time_ms = int(raw[0]) if raw and raw[0] is not None else 0
+    occurred_at = _timestamp_to_datetime(open_time_ms)
+    return BinanceBar(
+        symbol=symbol,
+        instrument_type=instrument_type,
+        timeframe=timeframe,
+        open_time_ms=open_time_ms,
+        occurred_at=occurred_at,
+        open=_to_decimal(raw[1]) or Decimal(0),
+        high=_to_decimal(raw[2]) or Decimal(0),
+        low=_to_decimal(raw[3]) or Decimal(0),
+        close=_to_decimal(raw[4]) or Decimal(0),
+        volume=_to_decimal(raw[5]) if len(raw) > 5 else Decimal(0),
+    )
+
+
+def _parse_ccxt_mark_price(symbol: str, instrument_type: str, raw: dict[str, Any]) -> BinanceMarkPrice:
+    # ccxt may expose the mark-price either at the dict root or under .info
+    info = raw.get("info") if isinstance(raw, dict) else None
+    mark_raw: Any = None
+    for key in ("markPrice", "mark_price", "mark"):
+        if isinstance(raw, dict) and raw.get(key) is not None:
+            mark_raw = raw.get(key)
+            break
+    if mark_raw is None and isinstance(info, dict):
+        for key in ("markPrice", "mark_price", "p"):
+            if info.get(key) is not None:
+                mark_raw = info.get(key)
+                break
+    if mark_raw is None and isinstance(raw, dict):
+        # Some builds return a ticker shape with ``last`` as the mark.
+        mark_raw = raw.get("last") if raw.get("last") is not None else raw.get("close")
+    index_raw: Any = None
+    if isinstance(raw, dict):
+        index_raw = raw.get("indexPrice")
+    if index_raw is None and isinstance(info, dict):
+        index_raw = info.get("indexPrice") or info.get("i")
+    occurred_at = _timestamp_to_datetime(raw.get("timestamp") if isinstance(raw, dict) else None)
+    return BinanceMarkPrice(
+        symbol=symbol,
+        instrument_type=instrument_type,
+        occurred_at=occurred_at,
+        mark_price=_to_decimal(mark_raw),
+        index_price=_to_decimal(index_raw),
+    )
+
+
+def _parse_ccxt_funding_rate(symbol: str, instrument_type: str, raw: dict[str, Any]) -> BinanceFundingRate:
+    rate = raw.get("fundingRate")
+    if rate is None:
+        info = raw.get("info") if isinstance(raw, dict) else None
+        if isinstance(info, dict):
+            rate = info.get("lastFundingRate") or info.get("fundingRate")
+    funding_ts = raw.get("fundingTimestamp") or raw.get("timestamp")
+    next_funding_ts = raw.get("nextFundingTimestamp") or raw.get("fundingDatetime")
+    if isinstance(next_funding_ts, str):
+        next_funding_ts = None
+    occurred_at = _timestamp_to_datetime(raw.get("timestamp"))
+    return BinanceFundingRate(
+        symbol=symbol,
+        instrument_type=instrument_type,
+        occurred_at=occurred_at,
+        funding_rate=_to_decimal(rate),
+        funding_timestamp_ms=int(funding_ts) if isinstance(funding_ts, (int, float)) else None,
+        next_funding_timestamp_ms=int(next_funding_ts) if isinstance(next_funding_ts, (int, float)) else None,
+    )
+
+
+def _parse_ccxt_open_interest(symbol: str, instrument_type: str, raw: dict[str, Any]) -> BinanceOpenInterest:
+    amount = raw.get("openInterestAmount")
+    if amount is None:
+        amount = raw.get("openInterest")
+    value = raw.get("openInterestValue")
+    if value is None:
+        info = raw.get("info") if isinstance(raw, dict) else None
+        if isinstance(info, dict):
+            value = info.get("sumOpenInterestValue") or info.get("notional")
+    occurred_at = _timestamp_to_datetime(raw.get("timestamp"))
+    return BinanceOpenInterest(
+        symbol=symbol,
+        instrument_type=instrument_type,
+        occurred_at=occurred_at,
+        open_interest_amount=_to_decimal(amount),
+        open_interest_value=_to_decimal(value),
+    )
