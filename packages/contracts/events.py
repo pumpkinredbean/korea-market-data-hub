@@ -12,11 +12,21 @@ TPayload = TypeVar("TPayload")
 
 
 class EventType(StrEnum):
-    """Current broker-neutral ingress event types."""
+    """Canonical broker-neutral ingress event types.
+
+    The list is intentionally provider-neutral; whether a given
+    (provider, venue, instrument_type) actually exposes a particular
+    event is decided by the capability matrix in the control plane.
+    """
 
     TRADE = "trade"
     ORDER_BOOK_SNAPSHOT = "order_book_snapshot"
     PROGRAM_TRADE = "program_trade"
+    TICKER = "ticker"
+    OHLCV = "ohlcv"
+    MARK_PRICE = "mark_price"
+    FUNDING_RATE = "funding_rate"
+    OPEN_INTEREST = "open_interest"
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +49,13 @@ CanonicalEventEnvelope = CanonicalEvent
 class DashboardEventEnvelope:
     """Broker-neutral envelope for live dashboard fan-out events.
 
-    `market_scope` represents request selection scope (`krx|nxt|total`), not a venue model.
+    ``market_scope`` represents the KRX request selection scope
+    (``krx|nxt|total``); it is empty / ignored for non-KRX providers.
+    ``provider`` is the externally exposed identifier (``kxt`` or
+    ``ccxt`` only — ``ccxt_pro`` is collapsed at the boundary).
+    ``raw_symbol`` is the venue-native symbol kept separate from
+    ``symbol`` (which carries the unified/display symbol such as
+    ``BTC/USDT``).
     """
 
     symbol: str
@@ -48,13 +64,18 @@ class DashboardEventEnvelope:
     payload: dict[str, Any]
     published_at: datetime
     schema_version: str = "v1"
+    provider: str | None = None
+    canonical_symbol: str | None = None
+    instrument_type: str | None = None
+    raw_symbol: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class DashboardControlEnvelope:
     """Broker-neutral envelope for dashboard publication control.
 
-    `market_scope` represents request selection scope (`krx|nxt|total`), not a venue model.
+    ``market_scope`` represents the KRX request selection scope
+    (``krx|nxt|total``); it is empty / ignored for non-KRX providers.
     """
 
     action: str
@@ -63,3 +84,7 @@ class DashboardControlEnvelope:
     market_scope: str
     requested_at: datetime
     schema_version: str = "v1"
+    provider: str | None = None
+    canonical_symbol: str | None = None
+    instrument_type: str | None = None
+    raw_symbol: str | None = None

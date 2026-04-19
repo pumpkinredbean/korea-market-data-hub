@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KIS Program Trade Realtime Admin</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="/static/admin.css" />
+</head>
+<body class="admin-body">
+  <div class="admin-app">
+    <header class="appbar">
+      <div class="appbar__title">
+        <div class="appbar__eyebrow">Operations Admin</div>
+        <h1>수집 대상 운영 워크플로우</h1>
+        <p>종목을 찾고, 기존 대상을 확인하고, 즉시 수정/저장한 뒤 실제 런타임 상태까지 한 작업면에서 이어서 처리합니다.</p>
+      </div>
+      <div class="appbar__actions">
+        <div id="snapshotMeta" class="snapshot-meta">스냅샷 불러오는 중</div>
+        <a class="app-link" href="/">뷰어 열기</a>
+        <button id="refreshSnapshotBtn" type="button">새로고침</button>
+      </div>
+    </header>
+
+    <div class="admin-layout">
+      <aside class="sidebar">
+        <div class="sidebar__section">
+          <div class="sidebar__label">Primary Jobs</div>
+          <nav class="sidebar__nav view-nav" aria-label="admin views">
+            <button type="button" class="sidebar__link is-active" data-view="workflow">대상 운영</button>
+            <button type="button" class="sidebar__link" data-view="events">이벤트 카탈로그</button>
+            <button type="button" class="sidebar__link" data-view="runtime">런타임 헬스</button>
+            <button type="button" class="sidebar__link" data-view="storage">스토리지 바인딩</button>
+          </nav>
+        </div>
+
+        <div class="sidebar__section">
+          <div class="sidebar__label">현재 작업 대상</div>
+          <div id="selectedInstrumentState" class="context-card empty-state"></div>
+        </div>
+
+        <div class="sidebar__section">
+          <div class="sidebar__label">운영 요약</div>
+          <div id="snapshotSummary" class="status-summary"></div>
+        </div>
+      </aside>
+
+      <main class="admin-main">
+        <section id="view-workflow" class="view-panel is-active" data-view-panel="workflow">
+          <header class="section-header">
+            <div>
+              <div class="panel-kicker">Main Operator Flow</div>
+              <h2>종목 기준 대상 운영</h2>
+              <p>검색 → 기존 대상 확인 → 인플레이스 저장/업데이트 → 결과 상태 확인 순서로 구성된 작업면입니다.</p>
+            </div>
+          </header>
+
+          <section class="workflow-board">
+            <article class="panel task-lane task-lane--search">
+              <header class="panel-header panel-header--tight">
+                <div>
+                  <div class="panel-kicker">Step 1</div>
+                  <h3>종목 찾기</h3>
+                  <p>종목코드 또는 종목명으로 검색한 뒤 작업할 심볼을 선택합니다.</p>
+                </div>
+              </header>
+
+              <form id="instrumentSearchForm" class="search-form">
+                <input id="searchQuery" placeholder="005930 또는 삼성전자" autocomplete="off" />
+                <select id="searchMarketScope" aria-label="종목 검색 시장 범위">
+                  <option value="krx">KRX</option>
+                  <option value="nxt">NXT</option>
+                  <option value="total" selected>TOTAL</option>
+                </select>
+                <button type="submit">검색</button>
+              </form>
+
+              <div id="searchStatus" class="inline-status"></div>
+              <div id="instrumentSearchResults" class="table-shell"></div>
+            </article>
+
+            <div class="task-stack">
+              <article class="panel">
+                <header class="panel-header panel-header--tight">
+                  <div>
+                    <div class="panel-kicker">Step 2</div>
+                    <h3>현재 대상 확인</h3>
+                    <p>선택한 종목 + 시장 범위 조합에 이미 연결된 대상과 현재 런타임 상태를 먼저 확인합니다.</p>
+                  </div>
+                </header>
+                <div id="targetSelectionSummary" class="info-box"></div>
+                <div id="selectedTargetRuntime" class="inspection-grid"></div>
+              </article>
+
+              <article class="panel" id="targetEditorPanel">
+                <header class="panel-header panel-header--tight">
+                  <div>
+                    <div id="targetFormTitle" class="panel-kicker">Step 3</div>
+                    <h3>대상 저장 / 업데이트</h3>
+                    <p id="targetFormHint">기존 대상이 있으면 새로 만들지 않고 같은 자리에서 업데이트합니다.</p>
+                  </div>
+                </header>
+
+                <form id="targetForm" class="target-form">
+                  <input id="targetId" type="hidden" />
+
+                  <div class="field-grid">
+                    <label class="field-block field-block--wide">
+                      <span class="label">종목코드</span>
+                      <input id="targetSymbol" placeholder="005930" required />
+                    </label>
+                    <label class="field-block">
+                      <span class="label">시장 범위</span>
+                      <select id="targetMarketScope" aria-label="수집 대상 시장 범위">
+                        <option value="krx">KRX</option>
+                        <option value="nxt">NXT</option>
+                        <option value="total" selected>TOTAL</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  <section class="selection-block">
+                    <div class="selection-block__header">
+                      <div>
+                        <div class="label">수집 이벤트</div>
+                        <div class="sub">최소 1개 이상 선택</div>
+                      </div>
+                      <div class="inline-actions">
+                        <button id="selectAllEventTypesBtn" type="button" class="secondary">전체 선택</button>
+                        <button id="clearEventTypesBtn" type="button" class="secondary">전체 해제</button>
+                      </div>
+                    </div>
+                    <div id="targetEventTypes" class="event-selector-grid"></div>
+                  </section>
+
+                  <label class="toggle-row">
+                    <input id="targetEnabled" type="checkbox" checked />
+                    <span>저장 후 바로 수집 활성화</span>
+                  </label>
+
+                  <div class="form-actions">
+                    <button id="submitTargetBtn" type="submit">저장 / 업데이트</button>
+                    <button id="resetTargetFormBtn" type="button" class="secondary">새 작업 시작</button>
+                  </div>
+                </form>
+
+                <div id="targetFormMessage" class="admin-message"></div>
+              </article>
+
+              <article class="panel">
+                <header class="panel-header panel-header--tight">
+                  <div>
+                    <div class="panel-kicker">Step 4</div>
+                    <h3>결과 상태 확인</h3>
+                    <p>방금 저장한 대상이 전체 목록에서 어떤 상태인지 즉시 재확인합니다.</p>
+                  </div>
+                </header>
+                <div id="targetsTable" class="table-shell"></div>
+              </article>
+            </div>
+          </section>
+        </section>
+
+        <section id="view-events" class="view-panel" data-view-panel="events" hidden>
+          <header class="section-header">
+            <div>
+              <div class="panel-kicker">Secondary Job</div>
+              <h2>이벤트 카탈로그</h2>
+              <p>설정 가능한 이벤트 종류만 빠르게 확인하는 보조 뷰입니다.</p>
+            </div>
+          </header>
+          <section class="panel">
+            <div id="eventCatalogTable" class="table-shell"></div>
+          </section>
+        </section>
+
+        <section id="view-runtime" class="view-panel" data-view-panel="runtime" hidden>
+          <header class="section-header">
+            <div>
+              <div class="panel-kicker">Secondary Job</div>
+              <h2>런타임 헬스</h2>
+              <p>서비스 단위 상태와 오류를 메인 작업 흐름과 분리해서 확인합니다.</p>
+            </div>
+          </header>
+          <section class="panel">
+            <div id="runtimeStatus" class="table-shell"></div>
+          </section>
+        </section>
+
+        <section id="view-storage" class="view-panel" data-view-panel="storage" hidden>
+          <header class="section-header">
+            <div>
+              <div class="panel-kicker">Secondary Job</div>
+              <h2>스토리지 바인딩</h2>
+              <p>연결된 저장소 바인딩 현황을 메인 대상 편집 작업과 분리해서 확인합니다.</p>
+            </div>
+          </header>
+          <section class="panel">
+            <div id="storageBindingsTable" class="table-shell"></div>
+          </section>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <script src="/static/admin.js"></script>
+</body>
+</html>

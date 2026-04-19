@@ -48,11 +48,13 @@ Today, `korea-market-data-hub` already contains the monorepo skeleton for that s
 - canonical event meaning should not depend on one provider's field names
 - raw, canonical, and derived data should remain distinct
 - serving models may optimize for query and UI needs, but should not redefine core event semantics
+- admin/control-plane models should keep collector as the upstream owner and web as a viewer-only downstream surface
 
 ## Related docs
 
 - `data-inventory.md`
 - `adapter-boundary.md`
+- `admin-control-plane.md`
 - `raw-canonical-derived.md`
 - `package-layout.md`
 - `../adr/ADR-001-broker-agnostic-core.md`

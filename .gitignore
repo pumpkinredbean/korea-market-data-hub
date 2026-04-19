@@ -33,6 +33,13 @@ webpy-*.log
 uvicorn-*.log
 web-*.log
 
+# Node / frontend build artefacts
+node_modules/
+dist/
+*.tsbuildinfo
+vite.config.d.ts
+vite.config.js
+
 # Local-only working directories
 data/
 logs/

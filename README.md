@@ -31,7 +31,7 @@
 사용자와 기여자가 이해해야 할 최소 구성만 정리하면 다음과 같습니다.
 
 - `collector`: 업스트림 시장 데이터 소스와 연결해 실시간 데이터를 받아오고, 대시보드 이벤트를 Redpanda로 발행하며, 제어용 구독 엔드포인트와 `/api/price-chart`, `/health`를 제공합니다.
-- `api-web`: Redpanda의 대시보드 이벤트를 소비해 브라우저 SSE로 전달하고, `src/web/` 정적 프런트엔드를 제공합니다.
+- `api-web`: Redpanda의 대시보드 이벤트를 소비해 브라우저 SSE로 전달하고, `src/web/` 정적 프런트엔드를 제공합니다. `/admin`은 viewer dashboard와 분리된 첫 admin/control-plane 화면입니다.
 - `redpanda`: 실시간 이벤트를 전달하는 메시지 브로커입니다.
 - `processor`: Compose에 포함되어 있지만 아직 최소 수준의 서비스입니다.
 - `clickhouse`: 향후 저장/분석 확장을 위한 구성 요소로 포함되어 있습니다.
@@ -182,6 +182,7 @@ Compose 내부에서는 `BOOTSTRAP_SERVERS=redpanda:9092`를 사용합니다.
 
 - 웹 앱: `http://127.0.0.1:8000`
 - collector health: `http://127.0.0.1:8001/health`
+- admin page: `http://127.0.0.1:8000/admin`
 
 ## Limitations
 
@@ -203,6 +204,7 @@ Compose 내부에서는 `BOOTSTRAP_SERVERS=redpanda:9092`를 사용합니다.
 ## Docs
 
 - 아키텍처 개요: `docs/architecture/overview.md`
+- 어드민/컨트롤 플레인 기초 모델: `docs/architecture/admin-control-plane.md`
 
 ## Contributing
 
