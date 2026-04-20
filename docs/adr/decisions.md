@@ -198,3 +198,41 @@ impact so later sessions can branch with full context.
   branch existed — deviation noted), commit `77eb5df`, pushed to
   `origin/chore/kxt-pypi-alignment`.
 - **상세 리포트**: `_vaults/market-data-vault/reviews/ksxt-migration-progress/kxt-pypi-alignment-step-report.md`.
+
+---
+
+## H32 — KXT pin bump (0.1.0a4 → 0.1.0a7)
+
+- **Status**: PASS
+- **Context**: H31 pinned `kxt==0.1.0a4`. Upstream released `0.1.0a7`.
+  Explorer diff between a4 and a7 confirmed changes are confined to
+  `src/kxt/cli/*` (CLI-only); Python API surface used by this repo is
+  unchanged. No runtime code edits required on the hub side.
+- **Action**:
+  - `requirements.txt`: bumped `kxt==0.1.0a4` → `kxt==0.1.0a7` (exact pin
+    retained so pip accepts the prerelease without `--pre`).
+- **검증**:
+  - `.venv/bin/pip install -r requirements.txt` succeeded; installed
+    `kxt` version confirmed via
+    `importlib.metadata.version("kxt")` → `0.1.0a7`.
+  - Targeted kxt-touching suites green:
+    `tests/test_collector_runtime.py`,
+    `tests/test_provider_runtime_control.py`,
+    `tests/test_multiprovider_step1.py`,
+    `tests/test_multiprovider_step3_identity.py`,
+    `tests/test_multiprovider_step4_capabilities.py`,
+    `tests/test_kxt_capability_sanitize.py`.
+  - Full `pytest -x -q` run covered as time permitted.
+  - Public API references used by this repo remain intact:
+    `kxt.requests.Subscription` (used in `apps/collector/runtime.py`) and
+    `kxt.models.market_data.QuoteLevel` — both still exported in a7.
+- **영향 / 잔존**:
+  - Supersedes/updates H31's version pin statement: the hub is now
+    aligned to `kxt==0.1.0a7`. All other H31 outcomes (compose bind-mount
+    removal, public `Subscription` import, etc.) remain in force.
+  - a4→a7 delta is CLI-only; removed CLI subcommands (market-status,
+    trades stream, order-events stream) are not invoked by this repo.
+  - Transitive constraints in a7 (`httpx>=0.27,<1`, `websockets>=12,<16`)
+    match the existing pins in `requirements.txt` — no conflict.
+  - Still a prerelease; re-pin when 0.1.x exits alpha.
+- **파일**: `requirements.txt`, `docs/adr/decisions.md`.
