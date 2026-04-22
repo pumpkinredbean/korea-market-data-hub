@@ -655,7 +655,9 @@ class ChartsStateStore:
                 continue
         for entry in data.get("scripts") or []:
             try:
-                script = IndicatorScriptSpec(**entry)
+                script = _script_spec_from_entry(entry)
+                if script is None:
+                    script = IndicatorScriptSpec(**entry)
                 if not script.builtin:
                     self._scripts[script.script_id] = script
             except Exception:  # noqa: BLE001
@@ -1074,15 +1076,141 @@ def _base_feed_from_entry(entry: Any) -> ChartPanelBaseFeed | None:
     )
 
 
+def synthesize_indicator_declaration(
+    indicator: Any, *, class_name: str | None = None
+) -> IndicatorDeclaration:
+    """Synthesize a minimum-viable :class:`IndicatorDeclaration` from a runtime
+    indicator instance (or class).
+
+    Used for user-uploaded Python scripts that did not ship a hand-authored
+    declaration; the result drives the admin inspector form so the same
+    input-slot mapper / outputs UI renders for custom scripts as for built-ins.
+
+    Logic:
+      * Read ``indicator.inputs`` (tuple of canonical event_name strings).
+        If absent or empty, default to ``("trade",)``.
+      * Build exactly one ``IndicatorInputDecl`` slot named ``"primary"``.
+      * No params (custom scripts have no declared params; the form skips).
+      * One ``IndicatorOutputDecl`` named ``"value"`` (kind ``"line"``,
+        ``is_primary=True``).
+    """
+    raw_inputs = getattr(indicator, "inputs", None) or ()
+    try:
+        inputs_tuple: tuple[str, ...] = tuple(str(x) for x in raw_inputs)
+    except TypeError:
+        inputs_tuple = ()
+    if not inputs_tuple:
+        inputs_tuple = ("trade",)
+    label = class_name or "value"
+    return IndicatorDeclaration(
+        inputs=(
+            IndicatorInputDecl(
+                slot_name="primary",
+                event_names=inputs_tuple,
+                required=True,
+            ),
+        ),
+        params=(),
+        outputs=(
+            IndicatorOutputDecl(
+                name="value",
+                kind="line",
+                label=label,
+                is_primary=True,
+            ),
+        ),
+    )
+
+
+def _declaration_from_entry(entry: Any) -> IndicatorDeclaration | None:
+    """Rehydrate an :class:`IndicatorDeclaration` from a dict (JSON round-trip).
+
+    Returns ``None`` (and logs a warning) on parse error rather than raising.
+    """
+    if entry is None:
+        return None
+    if isinstance(entry, IndicatorDeclaration):
+        return entry
+    if not isinstance(entry, dict):
+        return None
+    try:
+        raw_inputs = entry.get("inputs") or ()
+        inputs: list[IndicatorInputDecl] = []
+        for item in raw_inputs:
+            if isinstance(item, IndicatorInputDecl):
+                inputs.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            inputs.append(
+                IndicatorInputDecl(
+                    slot_name=str(item.get("slot_name") or ""),
+                    event_names=tuple(str(x) for x in (item.get("event_names") or ())),
+                    field_hints=tuple(str(x) for x in (item.get("field_hints") or ())),
+                    required=bool(item.get("required", True)),
+                )
+            )
+        raw_params = entry.get("params") or ()
+        params: list[IndicatorParamDecl] = []
+        for item in raw_params:
+            if isinstance(item, IndicatorParamDecl):
+                params.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            params.append(
+                IndicatorParamDecl(
+                    name=str(item.get("name") or ""),
+                    kind=str(item.get("kind") or "str"),
+                    default=item.get("default"),
+                    min=item.get("min"),
+                    max=item.get("max"),
+                    choices=tuple(item.get("choices") or ()),
+                    label=str(item.get("label") or ""),
+                    help=str(item.get("help") or ""),
+                )
+            )
+        raw_outputs = entry.get("outputs") or ()
+        outputs: list[IndicatorOutputDecl] = []
+        for item in raw_outputs:
+            if isinstance(item, IndicatorOutputDecl):
+                outputs.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            outputs.append(
+                IndicatorOutputDecl(
+                    name=str(item.get("name") or ""),
+                    kind=str(item.get("kind") or "line"),
+                    label=str(item.get("label") or ""),
+                    is_primary=bool(item.get("is_primary", False)),
+                )
+            )
+        return IndicatorDeclaration(
+            inputs=tuple(inputs),
+            params=tuple(params),
+            outputs=tuple(outputs),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("failed to rehydrate IndicatorDeclaration from dict: %s", exc)
+        return None
+
+
 def _script_spec_from_entry(entry: Any) -> IndicatorScriptSpec | None:
     if isinstance(entry, IndicatorScriptSpec):
         return entry
     if not isinstance(entry, dict):
         return None
     try:
-        decl = entry.get("declaration")
+        raw_decl = entry.get("declaration")
         # Declaration round-trip is best-effort: drop on read errors so
         # custom panel scripts still load even if declaration shape drifts.
+        if isinstance(raw_decl, IndicatorDeclaration):
+            decl = raw_decl
+        elif isinstance(raw_decl, dict):
+            decl = _declaration_from_entry(raw_decl)
+        else:
+            decl = None
         return IndicatorScriptSpec(
             script_id=str(entry.get("script_id") or ""),
             name=str(entry.get("name") or ""),
@@ -1090,7 +1218,7 @@ def _script_spec_from_entry(entry: Any) -> IndicatorScriptSpec | None:
             class_name=str(entry.get("class_name") or ""),
             builtin=bool(entry.get("builtin", False)),
             description=entry.get("description") if isinstance(entry.get("description"), str) else None,
-            declaration=decl if isinstance(decl, IndicatorDeclaration) else None,
+            declaration=decl,
         )
     except Exception:  # noqa: BLE001
         return None

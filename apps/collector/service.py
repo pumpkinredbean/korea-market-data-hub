@@ -94,6 +94,7 @@ from src.indicator_runtime import (
     new_instance_id,
     new_panel_id,
     new_script_id,
+    synthesize_indicator_declaration,
     validate_and_instantiate,
 )
 
@@ -839,7 +840,7 @@ async def admin_charts_upsert_panel(request: Request) -> JSONResponse:
             source = str(entry.get("source") or "")
             class_name = str(entry.get("class_name") or "").strip()
             try:
-                _, resolved_class = validate_and_instantiate(
+                instance, resolved_class = validate_and_instantiate(
                     source, class_name=class_name or None, params={}
                 )
             except ScriptValidationError as exc:
@@ -855,6 +856,9 @@ async def admin_charts_upsert_panel(request: Request) -> JSONResponse:
                     class_name=resolved_class,
                     builtin=False,
                     description=entry.get("description") if isinstance(entry.get("description"), str) else None,
+                    declaration=synthesize_indicator_declaration(
+                        instance, class_name=resolved_class
+                    ),
                 )
             )
 
@@ -947,7 +951,7 @@ async def admin_charts_upsert_script(request: Request) -> JSONResponse:
 
     # Validation + dry-run.
     try:
-        _, resolved_class = validate_and_instantiate(
+        instance, resolved_class = validate_and_instantiate(
             source,
             class_name=class_name or None,
             params={},
@@ -965,6 +969,9 @@ async def admin_charts_upsert_script(request: Request) -> JSONResponse:
         class_name=resolved_class,
         builtin=False,
         description=description if isinstance(description, str) else None,
+        declaration=synthesize_indicator_declaration(
+            instance, class_name=resolved_class
+        ),
     )
     saved = await charts_state_store.upsert_script(spec)
     return JSONResponse({"script": jsonable_encoder(saved)})

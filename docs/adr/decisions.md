@@ -236,3 +236,56 @@ impact so later sessions can branch with full context.
     match the existing pins in `requirements.txt` — no conflict.
   - Still a prerelease; re-pin when 0.1.x exits alpha.
 - **파일**: `requirements.txt`, `docs/adr/decisions.md`.
+
+---
+
+## H36 — Custom Indicator Declaration Synthesis (inspector-driven for user scripts)
+
+- **Status**: PASS
+- **Context**: Built-in indicators ship hand-authored `IndicatorDeclaration`
+  values that drive the admin inspector form (input slot mapper + params +
+  outputs). Custom user-uploaded Python scripts went through
+  `admin_charts_upsert_script` and persisted with `declaration=None`, so
+  the inspector had nothing to render for them — the form silently degraded
+  to a blank state. The `IndicatorScriptSpec` docstring promised runtime
+  synthesis when `declaration` was absent, but no synthesis call existed.
+- **Action**:
+  - `src/indicator_runtime.py`: added
+    `synthesize_indicator_declaration(indicator, *, class_name=None)` that
+    derives a minimum-viable declaration (one `primary` input slot from the
+    indicator class `inputs` tuple, no params, one primary `line` output
+    named `value`).
+  - `src/indicator_runtime.py`: `_script_spec_from_entry` now also accepts
+    dict-shaped `declaration` from persisted JSON and rehydrates the nested
+    `IndicatorInputDecl` / `IndicatorParamDecl` / `IndicatorOutputDecl`
+    dataclasses, falling back to `None` on parse error rather than
+    crashing. `ChartsStateStore.load()` now routes script entries through
+    the same helper so reloaded custom scripts retain their declarations.
+  - `apps/collector/service.py`: both custom-script upsert sites
+    (`admin_charts_upsert_script` PUT handler and the panel-scoped inline
+    parser) now call `synthesize_indicator_declaration(instance, class_name=...)`
+    after `validate_and_instantiate` and pass the result as
+    `declaration=` to `IndicatorScriptSpec(...)`.
+- **검증**:
+  - `python -m pytest tests/ -q` → `103 passed, 58 warnings in 1.96s`.
+  - `docker compose config` → OK (compose schema valid).
+  - New test file `tests/test_indicator_declaration_synthesis.py` covers:
+    synthesis of declaration from indicator instance, default inputs
+    fallback, end-to-end round-trip through `charts_state_store`, and
+    dict→dataclass rehydration in `_script_spec_from_entry`.
+- **영향 / 잔존**:
+  - User-uploaded Python indicators are now declaration-driven on first
+    save; the admin inspector renders the same form shape as for built-ins.
+  - Synthesis is intentionally minimum-viable (one input slot, no params,
+    one primary output). Authors who want richer parameter UIs can still
+    attach a hand-authored `IndicatorDeclaration` on `IndicatorScriptSpec`
+    construction; synthesis only fills the gap when none is provided.
+  - Numbering note: H33–H35 are tracked in the external vault only; this
+    repo log resumes at H36 as directed by the parent.
+- **파일**: `src/indicator_runtime.py`, `apps/collector/service.py`,
+  `tests/test_indicator_declaration_synthesis.py`, `docs/adr/decisions.md`,
+  `docs/adr/custom-indicator-declaration-synthesis-step-report.md`.
+- **Branch / commits**: `refactor/admin-charts-inspector-multiseries-step2`,
+  commit (see `git log -1 --format=%h` after this entry), pushed to
+  `origin/refactor/admin-charts-inspector-multiseries-step2`.
+- **상세 리포트**: `docs/adr/custom-indicator-declaration-synthesis-step-report.md`.
