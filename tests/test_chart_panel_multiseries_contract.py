@@ -1,103 +1,98 @@
-"""Contract tests for the multi-series ChartPanelSpec model (step 2).
+"""Contract tests for the indicator-first ChartPanelSpec model (step 36).
 
-Asserts:
-
-* ``series_bindings`` defaults to an empty tuple.
-* ``ChartPanelSpec`` and ``ChartSeriesBinding`` remain frozen.
-* ``dataclasses.replace`` can swap ``series_bindings`` to a new tuple.
-* ``asdict()`` serialises ``series_bindings`` as a list of dicts
-  (matching what the JSON snapshot on disk actually contains).
+Asserts the new ``ChartSeriesBinding`` shape is in effect and the legacy
+``source_kind`` / ``target_id`` / ``symbol`` / ``provider`` /
+``event_name`` / ``field_name`` fields are gone.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import json
 import unittest
 
 
-class ChartPanelMultiSeriesContractTests(unittest.TestCase):
-    def test_series_bindings_default_is_empty_tuple(self) -> None:
+class ChartPanelIndicatorFirstContractTests(unittest.TestCase):
+    def test_series_bindings_default_empty_and_panel_defaults_large(self) -> None:
         from packages.contracts.admin import ChartPanelSpec
 
-        spec = ChartPanelSpec(
-            panel_id="p1",
-            chart_type="line",
-            symbol="005930",
-        )
+        spec = ChartPanelSpec(panel_id="p1", chart_type="line", symbol="005930")
         self.assertEqual(spec.series_bindings, ())
-        self.assertEqual(spec.series_ref, "")
-        self.assertEqual(spec.source, "raw_event")
+        self.assertIsNone(spec.base_feed)
+        self.assertEqual(spec.scripts, ())
+        self.assertEqual(spec.instances, ())
+        # Larger first-run defaults.
+        self.assertEqual(spec.w, 12)
+        self.assertEqual(spec.h, 14)
 
     def test_panel_and_binding_are_frozen(self) -> None:
         from packages.contracts.admin import ChartPanelSpec, ChartSeriesBinding
 
-        binding = ChartSeriesBinding(binding_id="b1", source_kind="raw")
+        binding = ChartSeriesBinding(binding_id="b1", indicator_ref="builtin.raw")
         with self.assertRaises(dataclasses.FrozenInstanceError):
             binding.axis = "right"  # type: ignore[misc]
-        spec = ChartPanelSpec(
-            panel_id="p1",
-            chart_type="line",
-            symbol="005930",
-            series_bindings=(binding,),
-        )
+        spec = ChartPanelSpec(panel_id="p1", chart_type="line")
         with self.assertRaises(dataclasses.FrozenInstanceError):
-            spec.symbol = "000660"  # type: ignore[misc]
+            spec.symbol = "X"  # type: ignore[misc]
 
-    def test_replace_swaps_bindings(self) -> None:
-        from packages.contracts.admin import ChartPanelSpec, ChartSeriesBinding
+    def test_legacy_binding_fields_are_removed(self) -> None:
+        from packages.contracts.admin import ChartSeriesBinding
 
-        spec = ChartPanelSpec(panel_id="p1", chart_type="line", symbol="T")
-        b1 = ChartSeriesBinding(binding_id="b1", source_kind="raw", event_name="trade", field_name="price")
-        b2 = ChartSeriesBinding(binding_id="b2", source_kind="script", target_id="inst-xyz", output_name="value")
-        next_spec = dataclasses.replace(spec, series_bindings=(b1, b2))
-        self.assertEqual(len(next_spec.series_bindings), 2)
-        self.assertEqual(next_spec.series_bindings[0].event_name, "trade")
-        self.assertEqual(next_spec.series_bindings[1].target_id, "inst-xyz")
+        names = {f.name for f in dataclasses.fields(ChartSeriesBinding)}
+        for legacy in {"source_kind", "target_id", "symbol", "provider", "event_name", "field_name"}:
+            self.assertNotIn(legacy, names, f"deprecated field still present: {legacy}")
+        # New canonical fields are present.
+        for required in {"indicator_ref", "instance_id", "input_bindings", "param_values", "output_name"}:
+            self.assertIn(required, names)
 
-    def test_asdict_serialises_bindings_as_list_of_dicts(self) -> None:
-        import json
+    def test_legacy_panel_fields_are_removed(self) -> None:
+        from packages.contracts.admin import ChartPanelSpec
 
-        from packages.contracts.admin import ChartPanelSpec, ChartSeriesBinding
+        names = {f.name for f in dataclasses.fields(ChartPanelSpec)}
+        for legacy in {"source", "series_ref"}:
+            self.assertNotIn(legacy, names)
+        for required in {"base_feed", "scripts", "instances"}:
+            self.assertIn(required, names)
+
+    def test_input_bindings_param_values_output_name_round_trip(self) -> None:
+        from packages.contracts.admin import (
+            ChartInputSlot,
+            ChartPanelBaseFeed,
+            ChartPanelSpec,
+            ChartSeriesBinding,
+        )
 
         spec = ChartPanelSpec(
             panel_id="p1",
             chart_type="candle",
             symbol="BTCUSDT",
+            base_feed=ChartPanelBaseFeed(target_id="t-btc", event_name="ohlcv"),
             series_bindings=(
                 ChartSeriesBinding(
                     binding_id="b1",
-                    source_kind="raw",
-                    event_name="ohlcv",
-                    axis="left",
-                    label="OHLCV",
-                ),
-                ChartSeriesBinding(
-                    binding_id="b2",
-                    source_kind="raw",
-                    event_name="mark_price",
-                    field_name="value",
+                    indicator_ref="builtin.raw",
+                    input_bindings=(
+                        ChartInputSlot(slot_name="source", target_id="t-btc",
+                                       event_name="trade", field_name="price"),
+                    ),
+                    param_values=(("field", "price"),),
+                    output_name="value",
                     axis="right",
-                    label="Mark",
+                    color="#ffb000",
+                    label="trade.price",
                 ),
             ),
         )
-        dumped = dataclasses.asdict(spec)
-        # asdict preserves tuples for tuple fields; json serialisation
-        # (the persistence path) collapses tuples to lists, so reloading
-        # via json.loads yields list-of-dicts — assert that pipeline.
-        bindings_value = dumped["series_bindings"]
-        self.assertIn(type(bindings_value).__name__, {"tuple", "list"})
-        self.assertEqual(len(bindings_value), 2)
-        roundtripped = json.loads(json.dumps(dumped))
-        self.assertIsInstance(roundtripped["series_bindings"], list)
-        self.assertEqual(roundtripped["series_bindings"][0]["event_name"], "ohlcv")
-        self.assertEqual(roundtripped["series_bindings"][1]["axis"], "right")
-
-    def test_source_kinds_accept_raw_builtin_script(self) -> None:
-        from packages.contracts.admin import ChartSeriesBinding
-
-        for kind in ("raw", "builtin", "script"):
-            ChartSeriesBinding(binding_id=f"b-{kind}", source_kind=kind)
+        roundtripped = json.loads(json.dumps(dataclasses.asdict(spec)))
+        self.assertEqual(roundtripped["base_feed"]["target_id"], "t-btc")
+        b = roundtripped["series_bindings"][0]
+        self.assertEqual(b["indicator_ref"], "builtin.raw")
+        self.assertEqual(b["output_name"], "value")
+        self.assertEqual(b["input_bindings"][0]["slot_name"], "source")
+        self.assertEqual(b["input_bindings"][0]["field_name"], "price")
+        # param_values serialise as list-of-pairs.
+        self.assertEqual(b["param_values"][0][0], "field")
+        self.assertEqual(b["param_values"][0][1], "price")
 
 
 if __name__ == "__main__":

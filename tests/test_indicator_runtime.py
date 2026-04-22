@@ -190,5 +190,39 @@ class _StubControlPlane:
         return _cm()
 
 
+class RawPassthroughTests(unittest.TestCase):
+    def test_raw_passthrough_emits_series_point_for_trade_price(self) -> None:
+        from src.indicator_runtime import RawPassthroughIndicator
+
+        ind = RawPassthroughIndicator(field="price")
+        out = ind.on_event({
+            "event_type": "trade",
+            "symbol": "BTCUSDT",
+            "market_scope": "",
+            "payload": {"price": 12345.6, "size": 0.1, "occurred_at": "2026-04-21T12:00:00+00:00"},
+            "published_at": "2026-04-21T12:00:00+00:00",
+        })
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertEqual(out.value, 12345.6)
+        self.assertEqual(out.timestamp, "2026-04-21T12:00:00+00:00")
+        self.assertEqual(out.meta["field"], "price")
+
+    def test_raw_passthrough_defaults_field_per_event_type(self) -> None:
+        from src.indicator_runtime import RawPassthroughIndicator
+
+        ind = RawPassthroughIndicator()  # no field configured
+        out = ind.on_event({
+            "event_type": "ohlcv",
+            "symbol": "BTC",
+            "market_scope": "",
+            "payload": {"open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 100},
+            "published_at": "2026-04-21T12:00:00+00:00",
+        })
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertEqual(out.value, 1.5)
+
+
 if __name__ == "__main__":
     unittest.main()

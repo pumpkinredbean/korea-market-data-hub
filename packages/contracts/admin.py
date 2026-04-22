@@ -137,30 +137,105 @@ class SeriesPoint:
 
 
 @dataclass(frozen=True, slots=True)
+class ChartInputSlot:
+    """One declaration-driven input slot on a :class:`ChartSeriesBinding`.
+
+    ``slot_name`` is the declared slot identifier (e.g. ``"stream"`` for
+    builtin.raw or ``"orderbook"`` for builtin.obi).  The remaining
+    fields identify which live feed fills this slot.
+    """
+
+    slot_name: str
+    target_id: str = ""
+    event_name: str = ""
+    field_name: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ChartPanelBaseFeed:
+    """Candle base feed selector on a :class:`ChartPanelSpec`.
+
+    Candle panels render OHLCV from the raw event stream identified by
+    ``target_id`` + ``event_name``; overlay series live in
+    ``series_bindings``.
+    """
+
+    target_id: str = ""
+    event_name: str = "ohlcv"
+
+
+@dataclass(frozen=True, slots=True)
+class IndicatorInputDecl:
+    """Declaration for one input slot of an indicator."""
+
+    slot_name: str
+    event_names: tuple[str, ...] = ()
+    field_hints: tuple[str, ...] = ()
+    required: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class IndicatorParamDecl:
+    """Declaration for one parameter of an indicator.
+
+    ``kind`` ∈ {"int","float","str","bool","enum"}.
+    """
+
+    name: str
+    kind: str
+    default: Any = None
+    min: Any = None
+    max: Any = None
+    choices: tuple = ()
+    label: str = ""
+    help: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class IndicatorOutputDecl:
+    """Declaration for one output stream of an indicator.
+
+    ``kind`` ∈ {"line","histogram","marker"}.  Exactly one output
+    should carry ``is_primary=True``.
+    """
+
+    name: str
+    kind: str = "line"
+    label: str = ""
+    is_primary: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class IndicatorDeclaration:
+    """Declaration driving the inspector form for an indicator."""
+
+    inputs: tuple[IndicatorInputDecl, ...] = ()
+    params: tuple[IndicatorParamDecl, ...] = ()
+    outputs: tuple[IndicatorOutputDecl, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class ChartSeriesBinding:
-    """Per-series binding inside a :class:`ChartPanelSpec`.
+    """Indicator-first per-series binding inside a :class:`ChartPanelSpec`.
 
-    A panel may carry multiple series (e.g. a candle base plus line
-    overlays).  Each binding selects exactly one data source:
-
-    * ``source_kind = "raw"`` → the frontend reads from the raw-event
-      SSE stream for ``event_name``; scalar overlays pick
-      ``field_name`` out of the payload.
-    * ``source_kind = "builtin"`` → ``target_id`` is the built-in key
-      (e.g. ``"obi"``) and ``output_name`` selects which output stream
-      to render.
-    * ``source_kind = "script"`` → ``target_id`` is the activated
-      indicator ``instance_id`` and ``output_name`` is the logical
-      output stream (``"value"`` by default).
+    * ``indicator_ref`` selects the indicator (``"builtin.raw"``,
+      ``"builtin.obi"`` or a persisted script_id).
+    * ``instance_id`` links to a live ``IndicatorInstanceSpec`` when
+      the indicator requires runtime activation (custom scripts);
+      empty for pure passthrough (``builtin.raw``).
+    * ``input_bindings`` fills the declared input slots with
+      (slot_name, target_id, event_name, field_name).
+    * ``param_values`` is a tuple of (name, value) pairs preserving
+      frozen-dataclass hashability; the API boundary converts to/from
+      dict via :func:`param_values_as_dict` / :func:`param_values_from_dict`.
+    * ``output_name`` selects which declared output to render.
     """
 
     binding_id: str
-    source_kind: str
-    target_id: str = ""
-    symbol: str = ""
-    provider: str = ""
-    event_name: str = ""
-    field_name: str = ""
+    indicator_ref: str = ""
+    instance_id: str = ""
+    input_bindings: tuple[ChartInputSlot, ...] = ()
+    param_values: tuple[tuple[str, Any], ...] = ()
     output_name: str = ""
     axis: str = "left"
     color: str = ""
@@ -168,34 +243,40 @@ class ChartSeriesBinding:
     visible: bool = True
 
 
+def param_values_as_dict(values: tuple[tuple[str, Any], ...]) -> dict[str, Any]:
+    return {k: v for (k, v) in values}
+
+
+def param_values_from_dict(d: dict[str, Any] | None) -> tuple[tuple[str, Any], ...]:
+    if not d:
+        return ()
+    return tuple((str(k), v) for k, v in d.items())
+
+
 @dataclass(frozen=True, slots=True)
 class ChartPanelSpec:
-    """Admin-UI persisted panel descriptor.
+    """Admin-UI persisted panel descriptor (indicator-first).
 
-    Layout fields (``x``, ``y``, ``w``, ``h``) are integers in a 12-column
-    grid, matching ``react-grid-layout`` semantics.  ``chart_type`` is
-    ``"line"`` or ``"candle"``.  ``source`` selects the legacy input
-    stream (``"raw_event"`` or ``"indicator_output"``) for single-series
-    back-compat.
-
-    ``series_bindings`` is the canonical multi-series model.  When it
-    is non-empty the frontend renders one series per binding on the
-    same chart.  ``series_ref`` is kept as a legacy opaque string so
-    previously persisted panels continue to load round-trip.
+    ``chart_type`` is ``"line"`` or ``"candle"``.  Candle panels use
+    ``base_feed`` for the OHLCV base stream and treat ``series_bindings``
+    as overlay lines.  Line panels render every binding as a line.
+    Per-panel ``scripts`` and ``instances`` allow authoring indicators
+    inside a panel; the global registry still provides built-ins.
     """
 
     panel_id: str
     chart_type: str
-    symbol: str
-    source: str = "raw_event"
-    series_ref: str = ""
+    symbol: str = ""
     x: int = 0
     y: int = 0
-    w: int = 6
-    h: int = 6
+    w: int = 12
+    h: int = 14
     title: str | None = None
     notes: str | None = None
     series_bindings: tuple[ChartSeriesBinding, ...] = ()
+    base_feed: ChartPanelBaseFeed | None = None
+    scripts: tuple["IndicatorScriptSpec", ...] = ()
+    instances: tuple["IndicatorInstanceSpec", ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,7 +287,9 @@ class IndicatorScriptSpec:
     ``HubIndicator``.  ``class_name`` records which top-level class the
     runtime should instantiate.  ``builtin`` is true for indicators
     shipped with the hub (e.g. ``obi``) whose source is pinned and
-    whose validation step is skipped.
+    whose validation step is skipped.  ``declaration`` is optional and
+    drives the inspector form; when absent the runtime synthesises one
+    from the indicator's ``inputs`` class attribute.
     """
 
     script_id: str
@@ -215,6 +298,7 @@ class IndicatorScriptSpec:
     class_name: str
     builtin: bool = False
     description: str | None = None
+    declaration: IndicatorDeclaration | None = None
 
 
 @dataclass(frozen=True, slots=True)

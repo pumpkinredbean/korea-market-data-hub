@@ -758,7 +758,11 @@ tr.payload-row td {
 /* ── Charts View ─────────────────────────────────────────────────── */
 .charts-view .react-grid-layout {
   position: relative;
-  min-height: 400px;
+  min-height: 80vh;
+}
+.charts-view .charts-grid,
+.charts-view .layout {
+  min-height: 80vh;
 }
 .charts-view .chart-wrapper {
   background: #111418;
@@ -786,8 +790,9 @@ tr.payload-row td {
 }
 .charts-view .chart-host {
   flex: 1 1 auto;
-  min-height: 0;
+  min-height: 320px;
   width: 100%;
+  height: 100%;
 }
 .charts-view .script-editor {
   margin-top: 12px;
@@ -832,12 +837,6 @@ tr.payload-row td {
   user-select: none;
   color: #64748b;
   padding: 0 4px;
-}
-.charts-view .chart-host {
-  flex: 1 1 auto;
-  min-height: 0;
-  width: 100%;
-  height: 100%;
 }
 .charts-view .chart-legend {
   display: flex;

@@ -38,12 +38,20 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from packages.contracts.admin import (
+    ChartInputSlot,
+    ChartPanelBaseFeed,
     ChartPanelSpec,
     ChartSeriesBinding,
+    IndicatorDeclaration,
+    IndicatorInputDecl,
     IndicatorInstanceSpec,
+    IndicatorOutputDecl,
     IndicatorOutputEnvelope,
+    IndicatorParamDecl,
     IndicatorScriptSpec,
     SeriesPoint,
+    param_values_as_dict,
+    param_values_from_dict,
 )
 
 logger = logging.getLogger(__name__)
@@ -89,6 +97,120 @@ class HubIndicator:
 
 
 # ─── Built-in OBI indicator ──────────────────────────────────────────────────
+
+
+class RawPassthroughIndicator(HubIndicator):
+    """Pass-through indicator that re-emits one scalar field of a raw
+    event as a :class:`SeriesPoint`.
+
+    Declaration-driven: a single ``source`` input slot accepts ``ohlcv``,
+    ``trade``, ``mark_price``, or ``funding_rate`` events.  The ``field``
+    parameter (enum) selects which payload key to project.  A single
+    ``value`` line output is declared.
+
+    The runtime inspects ``inputs`` (here intentionally empty/wildcard)
+    and routes the configured raw stream into ``on_event`` via the
+    indicator-runtime's per-instance subscription path.  To keep the
+    legacy dispatch loop honest we also accept any incoming event and
+    extract ``params['field']`` (defaulting to ``close`` for ohlcv,
+    ``price`` for trade, ``value``/``rate`` for mark/funding).
+    """
+
+    name = "Raw"
+    inputs: tuple[str, ...] = ("ohlcv", "trade", "mark_price", "funding_rate")
+    output_kind = "line"
+
+    DEFAULT_FIELDS: dict[str, str] = {
+        "ohlcv": "close",
+        "trade": "price",
+        "mark_price": "value",
+        "funding_rate": "rate",
+    }
+
+    def on_event(self, event: dict[str, Any]) -> SeriesPoint | None:
+        payload = event.get("payload") or {}
+        if not isinstance(payload, dict):
+            return None
+        event_type = str(event.get("event_type") or "")
+        field = str(self.params.get("field") or self.DEFAULT_FIELDS.get(event_type) or "")
+        raw: Any = None
+        if field and field in payload:
+            raw = payload[field]
+        else:
+            for fallback in ("price", "close", "value", "rate", "mark_price"):
+                if fallback in payload:
+                    raw = payload[fallback]
+                    field = fallback
+                    break
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        timestamp = str(
+            payload.get("occurred_at")
+            or payload.get("timestamp")
+            or event.get("published_at")
+            or datetime.now(timezone.utc).isoformat()
+        )
+        return SeriesPoint(
+            timestamp=timestamp,
+            value=value,
+            meta={"field": field, "event_type": event_type},
+        )
+
+
+_RAW_PASSTHROUGH_DECLARATION = IndicatorDeclaration(
+    inputs=(
+        IndicatorInputDecl(
+            slot_name="source",
+            event_names=("ohlcv", "trade", "mark_price", "funding_rate"),
+            field_hints=(
+                "close", "open", "high", "low", "volume",
+                "price", "value", "rate", "mark_price",
+            ),
+            required=True,
+        ),
+    ),
+    params=(
+        IndicatorParamDecl(
+            name="field",
+            kind="enum",
+            default="close",
+            choices=("close", "open", "high", "low", "volume", "price", "value", "rate"),
+            label="Field",
+            help="Payload key to project as the line value.",
+        ),
+    ),
+    outputs=(
+        IndicatorOutputDecl(name="value", kind="line", label="value", is_primary=True),
+    ),
+)
+
+
+_OBI_DECLARATION = IndicatorDeclaration(
+    inputs=(
+        IndicatorInputDecl(
+            slot_name="orderbook",
+            event_names=("order_book_snapshot",),
+            field_hints=(),
+            required=True,
+        ),
+    ),
+    params=(
+        IndicatorParamDecl(
+            name="top_n",
+            kind="int",
+            default=5,
+            min=1,
+            max=50,
+            label="Top N",
+            help="Number of levels to aggregate on each side.",
+        ),
+    ),
+    outputs=(
+        IndicatorOutputDecl(name="obi", kind="line", label="OBI", is_primary=True),
+    ),
+)
 
 
 class OrderBookImbalanceIndicator(HubIndicator):
@@ -155,12 +277,22 @@ class OrderBookImbalanceIndicator(HubIndicator):
 
 BUILTIN_SCRIPTS: tuple[IndicatorScriptSpec, ...] = (
     IndicatorScriptSpec(
+        script_id="builtin.raw",
+        name="Raw passthrough",
+        source="# builtin: see src.indicator_runtime.RawPassthroughIndicator\n",
+        class_name="RawPassthroughIndicator",
+        builtin=True,
+        description="Re-emit one scalar field of a raw event as a line series.",
+        declaration=_RAW_PASSTHROUGH_DECLARATION,
+    ),
+    IndicatorScriptSpec(
         script_id="builtin.obi",
         name="OBI (Order Book Imbalance)",
         source="# builtin: see src.indicator_runtime.OrderBookImbalanceIndicator\n",
         class_name="OrderBookImbalanceIndicator",
         builtin=True,
         description="Top-N order book imbalance; inputs=order_book_snapshot.",
+        declaration=_OBI_DECLARATION,
     ),
 )
 
@@ -439,6 +571,15 @@ class ChartsStateStore:
     async def upsert_panel(self, panel: ChartPanelSpec) -> ChartPanelSpec:
         async with self._lock:
             self._panels[panel.panel_id] = panel
+            # Register panel-scoped scripts + instances into the global
+            # registry so the runtime can build indicators referenced by
+            # this panel's bindings without duplicating dispatch paths.
+            for script in panel.scripts or ():
+                if script.script_id and not script.script_id.startswith("builtin."):
+                    self._scripts[script.script_id] = script
+            for inst in panel.instances or ():
+                if inst.instance_id:
+                    self._instances[inst.instance_id] = inst
             self._persist_locked()
             return panel
 
@@ -767,6 +908,8 @@ def _build_indicator(script: IndicatorScriptSpec, params: dict[str, Any]) -> Hub
     if script.builtin:
         if script.class_name == "OrderBookImbalanceIndicator":
             return OrderBookImbalanceIndicator(**(params or {}))
+        if script.class_name == "RawPassthroughIndicator":
+            return RawPassthroughIndicator(**(params or {}))
         raise ValueError(f"unknown built-in indicator: {script.class_name}")
     instance, _ = validate_and_instantiate(
         script.source,
@@ -791,15 +934,17 @@ def new_instance_id() -> str:
 # ─── Panel persistence helpers ──────────────────────────────────────────────
 
 
+_CHART_INPUT_SLOT_FIELDS: frozenset[str] = frozenset(
+    {"slot_name", "target_id", "event_name", "field_name"}
+)
+
 _CHART_SERIES_BINDING_FIELDS: frozenset[str] = frozenset(
     {
         "binding_id",
-        "source_kind",
-        "target_id",
-        "symbol",
-        "provider",
-        "event_name",
-        "field_name",
+        "indicator_ref",
+        "instance_id",
+        "input_bindings",
+        "param_values",
         "output_name",
         "axis",
         "color",
@@ -813,8 +958,6 @@ _CHART_PANEL_FIELDS: frozenset[str] = frozenset(
         "panel_id",
         "chart_type",
         "symbol",
-        "source",
-        "series_ref",
         "x",
         "y",
         "w",
@@ -822,26 +965,157 @@ _CHART_PANEL_FIELDS: frozenset[str] = frozenset(
         "title",
         "notes",
         "series_bindings",
+        "base_feed",
+        "scripts",
+        "instances",
     }
 )
+
+
+def _input_slot_from_entry(entry: Any) -> ChartInputSlot:
+    if isinstance(entry, ChartInputSlot):
+        return entry
+    if not isinstance(entry, dict):
+        return ChartInputSlot(slot_name="")
+    filtered = {k: str(v or "") for k, v in entry.items() if k in _CHART_INPUT_SLOT_FIELDS}
+    return ChartInputSlot(**filtered)
+
+
+def _migrate_legacy_binding(entry: dict[str, Any]) -> dict[str, Any]:
+    """Convert a pre-step36 binding dict to the new indicator-first shape.
+
+    Legacy bindings carried ``source_kind`` ∈ {raw, builtin, script}
+    plus ``target_id``/``event_name``/``field_name``.  This function
+    returns an entry that uses ``indicator_ref`` + ``input_bindings``
+    + ``param_values`` instead.  Already-new entries pass through.
+    """
+    if "indicator_ref" in entry and entry.get("indicator_ref"):
+        return entry
+    source_kind = str(entry.get("source_kind") or "").strip().lower()
+    if not source_kind:
+        return entry  # nothing to migrate
+    new_entry = {
+        k: v for k, v in entry.items() if k in _CHART_SERIES_BINDING_FIELDS
+    }
+    new_entry["binding_id"] = entry.get("binding_id") or f"bind-{uuid.uuid4().hex[:10]}"
+    new_entry.setdefault("axis", entry.get("axis") or "left")
+    new_entry.setdefault("color", entry.get("color") or "")
+    new_entry.setdefault("label", entry.get("label") or "")
+    new_entry.setdefault("visible", bool(entry.get("visible", True)))
+    if source_kind == "raw":
+        target_id = str(entry.get("target_id") or entry.get("symbol") or "")
+        event_name = str(entry.get("event_name") or "trade")
+        field_name = str(entry.get("field_name") or "")
+        new_entry["indicator_ref"] = "builtin.raw"
+        new_entry["input_bindings"] = (
+            {
+                "slot_name": "source",
+                "target_id": target_id,
+                "event_name": event_name,
+                "field_name": field_name,
+            },
+        )
+        if field_name:
+            new_entry["param_values"] = (("field", field_name),)
+        new_entry["output_name"] = entry.get("output_name") or "value"
+    else:  # builtin or script
+        target_id = str(entry.get("target_id") or "")
+        new_entry["indicator_ref"] = target_id or ("builtin.obi" if source_kind == "builtin" else "")
+        new_entry["instance_id"] = target_id if source_kind == "script" else ""
+        new_entry["output_name"] = entry.get("output_name") or "obi"
+        new_entry["input_bindings"] = ()
+        new_entry["param_values"] = ()
+    return new_entry
 
 
 def _series_binding_from_entry(entry: Any) -> ChartSeriesBinding:
     """Reconstruct a :class:`ChartSeriesBinding` from a persisted dict.
 
-    Unknown keys are filtered defensively so forward-compatible
-    snapshots do not break old deployments and vice-versa.
+    Legacy snapshots are migrated in-place; unknown keys are ignored.
     """
     if isinstance(entry, ChartSeriesBinding):
         return entry
     if not isinstance(entry, dict):
         raise ValueError("series_binding entry must be a dict")
-    filtered = {k: v for k, v in entry.items() if k in _CHART_SERIES_BINDING_FIELDS}
+    migrated = _migrate_legacy_binding(entry)
+    filtered: dict[str, Any] = {
+        k: v for k, v in migrated.items() if k in _CHART_SERIES_BINDING_FIELDS
+    }
+    raw_inputs = filtered.get("input_bindings") or ()
+    if isinstance(raw_inputs, (list, tuple)):
+        filtered["input_bindings"] = tuple(_input_slot_from_entry(r) for r in raw_inputs)
+    else:
+        filtered["input_bindings"] = ()
+    raw_params = filtered.get("param_values") or ()
+    if isinstance(raw_params, dict):
+        filtered["param_values"] = param_values_from_dict(raw_params)
+    elif isinstance(raw_params, (list, tuple)):
+        coerced: list[tuple[str, Any]] = []
+        for pv in raw_params:
+            if isinstance(pv, (list, tuple)) and len(pv) >= 2:
+                coerced.append((str(pv[0]), pv[1]))
+        filtered["param_values"] = tuple(coerced)
+    else:
+        filtered["param_values"] = ()
+    filtered.setdefault("binding_id", f"bind-{uuid.uuid4().hex[:10]}")
     return ChartSeriesBinding(**filtered)
 
 
+def _base_feed_from_entry(entry: Any) -> ChartPanelBaseFeed | None:
+    if entry is None:
+        return None
+    if isinstance(entry, ChartPanelBaseFeed):
+        return entry
+    if not isinstance(entry, dict):
+        return None
+    return ChartPanelBaseFeed(
+        target_id=str(entry.get("target_id") or ""),
+        event_name=str(entry.get("event_name") or "ohlcv"),
+    )
+
+
+def _script_spec_from_entry(entry: Any) -> IndicatorScriptSpec | None:
+    if isinstance(entry, IndicatorScriptSpec):
+        return entry
+    if not isinstance(entry, dict):
+        return None
+    try:
+        decl = entry.get("declaration")
+        # Declaration round-trip is best-effort: drop on read errors so
+        # custom panel scripts still load even if declaration shape drifts.
+        return IndicatorScriptSpec(
+            script_id=str(entry.get("script_id") or ""),
+            name=str(entry.get("name") or ""),
+            source=str(entry.get("source") or ""),
+            class_name=str(entry.get("class_name") or ""),
+            builtin=bool(entry.get("builtin", False)),
+            description=entry.get("description") if isinstance(entry.get("description"), str) else None,
+            declaration=decl if isinstance(decl, IndicatorDeclaration) else None,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _instance_spec_from_entry(entry: Any) -> IndicatorInstanceSpec | None:
+    if isinstance(entry, IndicatorInstanceSpec):
+        return entry
+    if not isinstance(entry, dict):
+        return None
+    try:
+        return IndicatorInstanceSpec(
+            instance_id=str(entry.get("instance_id") or ""),
+            script_id=str(entry.get("script_id") or ""),
+            symbol=str(entry.get("symbol") or ""),
+            market_scope=str(entry.get("market_scope") or ""),
+            params=entry.get("params") if isinstance(entry.get("params"), dict) else {},
+            enabled=bool(entry.get("enabled", True)),
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _panel_spec_from_entry(entry: dict) -> ChartPanelSpec:
-    """Reconstruct a :class:`ChartPanelSpec` tolerating new/old shapes."""
+    """Reconstruct a :class:`ChartPanelSpec` tolerating legacy shapes."""
     filtered = {k: v for k, v in entry.items() if k in _CHART_PANEL_FIELDS}
     bindings = filtered.get("series_bindings")
     if bindings:
@@ -850,4 +1124,34 @@ def _panel_spec_from_entry(entry: dict) -> ChartPanelSpec:
         )
     else:
         filtered["series_bindings"] = ()
+    filtered["base_feed"] = _base_feed_from_entry(filtered.get("base_feed"))
+    raw_scripts = filtered.get("scripts") or ()
+    if isinstance(raw_scripts, (list, tuple)):
+        filtered["scripts"] = tuple(
+            s for s in (_script_spec_from_entry(r) for r in raw_scripts) if s is not None
+        )
+    else:
+        filtered["scripts"] = ()
+    raw_instances = filtered.get("instances") or ()
+    if isinstance(raw_instances, (list, tuple)):
+        filtered["instances"] = tuple(
+            i for i in (_instance_spec_from_entry(r) for r in raw_instances) if i is not None
+        )
+    else:
+        filtered["instances"] = ()
+    # Legacy panels: chart_type=='candle' with no base_feed but a first
+    # raw binding can synthesise a base_feed for back-compat.
+    if (
+        filtered.get("chart_type") == "candle"
+        and filtered.get("base_feed") is None
+        and filtered["series_bindings"]
+    ):
+        first = filtered["series_bindings"][0]
+        if first.indicator_ref == "builtin.raw" and first.input_bindings:
+            slot = first.input_bindings[0]
+            if (slot.event_name or "ohlcv") == "ohlcv":
+                filtered["base_feed"] = ChartPanelBaseFeed(
+                    target_id=slot.target_id, event_name="ohlcv"
+                )
+                filtered["series_bindings"] = filtered["series_bindings"][1:]
     return ChartPanelSpec(**filtered)

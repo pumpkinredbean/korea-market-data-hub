@@ -70,10 +70,14 @@ from apps.collector.publisher import CollectorPublisher
 from apps.collector.runtime import CollectorRuntime, SUPPORTED_MARKET_SCOPES
 from packages.adapters import build_default_registry
 from packages.contracts.admin import (
+    ChartInputSlot,
+    ChartPanelBaseFeed,
     ChartPanelSpec,
     ChartSeriesBinding,
+    IndicatorDeclaration,
     IndicatorInstanceSpec,
     IndicatorScriptSpec,
+    param_values_from_dict,
 )
 from packages.contracts.events import EventType
 from packages.contracts.topics import DASHBOARD_CONTROL_TOPIC
@@ -764,61 +768,155 @@ async def admin_charts_list_panels() -> JSONResponse:
 @app.put("/admin/charts/panels")
 async def admin_charts_upsert_panel(request: Request) -> JSONResponse:
     body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="panel body must be a JSON object")
     try:
         panel_id = (body.get("panel_id") or "").strip() or new_panel_id()
+        chart_type = str(body.get("chart_type") or "line").strip()
+        if chart_type not in {"line", "candle"}:
+            raise HTTPException(status_code=400, detail="chart_type must be 'line' or 'candle'")
+
+        # Bindings.
         raw_bindings = body.get("series_bindings") or ()
-        bindings: tuple[ChartSeriesBinding, ...]
-        if isinstance(raw_bindings, (list, tuple)):
-            parsed: list[ChartSeriesBinding] = []
-            for entry in raw_bindings:
-                if not isinstance(entry, dict):
-                    continue
-                parsed.append(
-                    ChartSeriesBinding(
-                        binding_id=str(entry.get("binding_id") or "").strip()
-                        or f"bind-{uuid.uuid4().hex[:10]}",
-                        source_kind=str(entry.get("source_kind") or "raw"),
-                        target_id=str(entry.get("target_id") or ""),
-                        symbol=str(entry.get("symbol") or "").strip(),
-                        provider=str(entry.get("provider") or ""),
-                        event_name=str(entry.get("event_name") or ""),
-                        field_name=str(entry.get("field_name") or ""),
-                        output_name=str(entry.get("output_name") or ""),
-                        axis=str(entry.get("axis") or "left"),
-                        color=str(entry.get("color") or ""),
-                        label=str(entry.get("label") or ""),
-                        visible=bool(entry.get("visible", True)),
-                    )
+        if not isinstance(raw_bindings, (list, tuple)):
+            raise HTTPException(status_code=400, detail="series_bindings must be a list")
+        parsed_bindings: list[ChartSeriesBinding] = []
+        for idx, entry in enumerate(raw_bindings):
+            if not isinstance(entry, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"series_bindings[{idx}] must be an object",
                 )
-            bindings = tuple(parsed)
-        else:
-            bindings = ()
+            input_bindings_raw = entry.get("input_bindings") or ()
+            if not isinstance(input_bindings_raw, (list, tuple)):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"series_bindings[{idx}].input_bindings must be a list",
+                )
+            input_bindings = tuple(
+                ChartInputSlot(
+                    slot_name=str(slot.get("slot_name") or "") if isinstance(slot, dict) else "",
+                    target_id=str(slot.get("target_id") or "") if isinstance(slot, dict) else "",
+                    event_name=str(slot.get("event_name") or "") if isinstance(slot, dict) else "",
+                    field_name=str(slot.get("field_name") or "") if isinstance(slot, dict) else "",
+                )
+                for slot in input_bindings_raw
+            )
+            param_values = body_param_values(entry.get("param_values"))
+            parsed_bindings.append(
+                ChartSeriesBinding(
+                    binding_id=str(entry.get("binding_id") or "").strip()
+                    or f"bind-{uuid.uuid4().hex[:10]}",
+                    indicator_ref=str(entry.get("indicator_ref") or "").strip(),
+                    instance_id=str(entry.get("instance_id") or "").strip(),
+                    input_bindings=input_bindings,
+                    param_values=param_values,
+                    output_name=str(entry.get("output_name") or "").strip(),
+                    axis=str(entry.get("axis") or "left"),
+                    color=str(entry.get("color") or ""),
+                    label=str(entry.get("label") or ""),
+                    visible=bool(entry.get("visible", True)),
+                )
+            )
+
+        # Base feed.
+        base_feed_raw = body.get("base_feed")
+        base_feed: ChartPanelBaseFeed | None = None
+        if isinstance(base_feed_raw, dict):
+            base_feed = ChartPanelBaseFeed(
+                target_id=str(base_feed_raw.get("target_id") or ""),
+                event_name=str(base_feed_raw.get("event_name") or "ohlcv"),
+            )
+
+        # Panel-scoped scripts + instances (optional).
+        panel_scripts: list[IndicatorScriptSpec] = []
+        for entry in body.get("scripts") or ():
+            if not isinstance(entry, dict):
+                continue
+            sid = str(entry.get("script_id") or "").strip() or new_script_id()
+            if sid.startswith("builtin."):
+                continue  # built-ins are read-only
+            source = str(entry.get("source") or "")
+            class_name = str(entry.get("class_name") or "").strip()
+            try:
+                _, resolved_class = validate_and_instantiate(
+                    source, class_name=class_name or None, params={}
+                )
+            except ScriptValidationError as exc:
+                return JSONResponse(
+                    {"error": "validation_failed", "field": "scripts", "errors": exc.errors},
+                    status_code=422,
+                )
+            panel_scripts.append(
+                IndicatorScriptSpec(
+                    script_id=sid,
+                    name=str(entry.get("name") or sid),
+                    source=source,
+                    class_name=resolved_class,
+                    builtin=False,
+                    description=entry.get("description") if isinstance(entry.get("description"), str) else None,
+                )
+            )
+
+        panel_instances: list[IndicatorInstanceSpec] = []
+        for entry in body.get("instances") or ():
+            if not isinstance(entry, dict):
+                continue
+            iid = str(entry.get("instance_id") or "").strip() or new_instance_id()
+            sid = str(entry.get("script_id") or "").strip()
+            if not sid:
+                continue
+            params = entry.get("params")
+            panel_instances.append(
+                IndicatorInstanceSpec(
+                    instance_id=iid,
+                    script_id=sid,
+                    symbol=str(entry.get("symbol") or "").strip(),
+                    market_scope=str(entry.get("market_scope") or "").strip().lower(),
+                    params=params if isinstance(params, dict) else {},
+                    enabled=bool(entry.get("enabled", True)),
+                )
+            )
+
         spec = ChartPanelSpec(
             panel_id=panel_id,
-            chart_type=str(body.get("chart_type") or "line"),
+            chart_type=chart_type,
             symbol=str(body.get("symbol") or "").strip(),
-            source=str(body.get("source") or "raw_event"),
-            series_ref=str(body.get("series_ref") or ""),
             x=int(body.get("x") or 0),
             y=int(body.get("y") or 0),
-            w=int(body.get("w") or 6),
-            h=int(body.get("h") or 6),
+            w=int(body.get("w") or 12),
+            h=int(body.get("h") or 14),
             title=body.get("title"),
             notes=body.get("notes"),
-            series_bindings=bindings,
+            series_bindings=tuple(parsed_bindings),
+            base_feed=base_feed,
+            scripts=tuple(panel_scripts),
+            instances=tuple(panel_instances),
         )
+    except HTTPException:
+        raise
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"invalid panel: {exc}") from exc
-    if spec.chart_type not in {"line", "candle"}:
-        raise HTTPException(status_code=400, detail="chart_type must be 'line' or 'candle'")
-    for binding in spec.series_bindings:
-        if binding.source_kind not in {"raw", "builtin", "script"}:
-            raise HTTPException(
-                status_code=400,
-                detail=f"invalid series_binding.source_kind: {binding.source_kind}",
-            )
+
     saved = await charts_state_store.upsert_panel(spec)
+    await indicator_runtime_manager.reconcile()
     return JSONResponse({"panel": jsonable_encoder(saved)})
+
+
+def body_param_values(raw: Any):
+    if raw is None:
+        return ()
+    if isinstance(raw, dict):
+        return param_values_from_dict(raw)
+    if isinstance(raw, (list, tuple)):
+        out: list[tuple[str, Any]] = []
+        for pv in raw:
+            if isinstance(pv, (list, tuple)) and len(pv) >= 2:
+                out.append((str(pv[0]), pv[1]))
+            elif isinstance(pv, dict) and "name" in pv:
+                out.append((str(pv["name"]), pv.get("value")))
+        return tuple(out)
+    return ()
 
 
 @app.delete("/admin/charts/panels/{panel_id}")
@@ -931,6 +1029,49 @@ async def admin_charts_delete_instance(instance_id: str) -> JSONResponse:
 @app.get("/admin/charts/errors")
 async def admin_charts_errors() -> JSONResponse:
     return JSONResponse({"instances": await indicator_runtime_manager.instance_states()})
+
+
+@app.get("/admin/charts/indicators")
+async def admin_charts_list_indicators(
+    panel_id: str | None = Query(None),
+) -> JSONResponse:
+    """List indicators available to bindings.
+
+    Always returns global built-ins (``builtin.raw`` + ``builtin.obi``)
+    plus any custom user scripts registered globally.  When ``panel_id``
+    is supplied, panel-scoped scripts are merged on top so the inspector
+    can render its per-panel script library.
+    """
+    scripts = await charts_state_store.list_scripts()
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for script in scripts:
+        seen.add(script.script_id)
+        items.append(
+            {
+                "script_id": script.script_id,
+                "name": script.name,
+                "builtin": script.builtin,
+                "declaration": jsonable_encoder(script.declaration) if script.declaration else None,
+            }
+        )
+    if panel_id:
+        panels = await charts_state_store.list_panels()
+        match = next((p for p in panels if p.panel_id == panel_id), None)
+        if match is not None:
+            for s in match.scripts or ():
+                if s.script_id in seen:
+                    continue
+                seen.add(s.script_id)
+                items.append(
+                    {
+                        "script_id": s.script_id,
+                        "name": s.name,
+                        "builtin": s.builtin,
+                        "declaration": jsonable_encoder(s.declaration) if s.declaration else None,
+                    }
+                )
+    return JSONResponse({"indicators": items})
 
 
 # Event names for which a raw runtime event is forwarded over
