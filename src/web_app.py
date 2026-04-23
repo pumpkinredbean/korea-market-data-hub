@@ -530,6 +530,11 @@ async def admin_charts_indicators_relay(
     return await _relay_collector_json("GET", "/admin/charts/indicators", params=params)
 
 
+@app.get("/api/admin/charts/event-schemas")
+async def admin_charts_event_schemas_relay() -> JSONResponse:
+    return await _relay_collector_json("GET", "/admin/charts/event-schemas")
+
+
 @app.get("/api/admin/charts/stream")
 async def admin_charts_stream_relay(request: Request) -> StreamingResponse:
     async def event_generator() -> Any:

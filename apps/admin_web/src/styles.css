@@ -772,6 +772,13 @@ tr.payload-row td {
   flex-direction: column;
   overflow: hidden;
   color: #d0d0d0;
+  /* Critical: react-grid-layout sets a fixed pixel height on this wrapper.
+     Without min-height: 0 the inner flex children (chart-host) refuse to
+     shrink below their intrinsic content size and overflow the panel. */
+  min-height: 0;
+  height: 100%;
+  width: 100%;
+  box-sizing: border-box;
 }
 .charts-view .chart-wrapper-head {
   display: flex;
@@ -783,6 +790,7 @@ tr.payload-row td {
   cursor: move;
   font-size: 12px;
   gap: 8px;
+  flex: 0 0 auto;
 }
 .charts-view .chart-wrapper-head select {
   font-size: 11px;
@@ -790,9 +798,13 @@ tr.payload-row td {
 }
 .charts-view .chart-host {
   flex: 1 1 auto;
-  min-height: 320px;
+  /* min-height must be 0 so the host can shrink with the grid item;
+     a non-zero floor here was the primary overflow vector. */
+  min-height: 0;
   width: 100%;
   height: 100%;
+  position: relative;
+  overflow: hidden;
 }
 .charts-view .script-editor {
   margin-top: 12px;
@@ -847,6 +859,9 @@ tr.payload-row td {
   border-top: 1px solid #2a2f38;
   color: #cbd5e1;
   font-size: 11px;
+  flex: 0 0 auto;
+  max-height: 60px;
+  overflow-y: auto;
 }
 .charts-view .chart-legend-item {
   display: inline-flex;

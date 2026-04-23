@@ -289,3 +289,21 @@ impact so later sessions can branch with full context.
   commit (see `git log -1 --format=%h` after this entry), pushed to
   `origin/refactor/admin-charts-inspector-multiseries-step2`.
 - **상세 리포트**: `docs/adr/custom-indicator-declaration-synthesis-step-report.md`.
+
+## H37: Charts panel overflow fix + target-aware schema-aware inspector selectors
+
+- **결정**: `/admin/charts` 패널의 overflow를 CSS flex chain의 `min-height: 0` 누락으로 진단하고, inspector의 event/field 선택을 정적 declaration이 아닌 target capability + canonical event schema 기반 cascade로 전환.
+- **이유**:
+  - `chart-host`가 `min-height: 320px`을 갖고 `chart-wrapper`(react-grid-layout이 픽셀 높이를 직접 부여)에 `min-height: 0`이 없어, 그리드 행 높이가 320px 미만일 때 chart 캔버스가 패널 경계 밖으로 흘러나갔다 (단순한 layout key bump으로는 해결 불가).
+  - 기존 inspector는 `inp.event_names`(slot 정적 선언)를 그대로 옵션으로 노출해 target이 실제로 publish하지 못하는 event도 선택 가능했고, field는 `inp.field_hints` datalist만 사용해 canonical schema/실측 payload를 무시했다.
+- **변경 요약**:
+  - CSS: `.chart-wrapper`에 `min-height:0; height:100%;`, `.chart-host`는 `min-height:0; overflow:hidden; position:relative;`로 정정. head/legend는 `flex:0 0 auto`.
+  - 신규 모듈 `packages/contracts/event_schemas.py`: `EventType`별 canonical scalar field 매핑 + `canonical_event_field_schema()` JSON snapshot.
+  - 신규 endpoint `GET /admin/charts/event-schemas` (collector) 및 web 릴레이.
+  - `ChartsView.tsx`: helpers `findCapabilityForTarget`, `computeAllowedEvents`, `sampledPayloadFields`, `computeAllowedFields(canonical → runtime decl → sampled payload → field_hints)`. `PanelInspector`는 target/capabilities/canonicalSchemas/rawEvents를 받아 cascade reset(target 변경 시 stale event 제거, event 변경 시 stale field 제거)을 수행.
+  - `App.tsx`는 target에 `instrument.venue`를 추가로 전달해 capability 매칭이 가능하도록 함.
+- **테스트**: `tests/test_event_field_schemas.py` (5 cases) — 모든 EventType이 schema 보유, core field 내용, jsonable shape, FastAPI endpoint 응답 동등성. `pytest tests/ -q` → 108 passed.
+- **영향 / 잔존**:
+  - 정적 `event_names`/`field_hints`는 fallback으로만 잔존; primary는 capability + canonical schema.
+  - Sampled payload layer는 SSE로 들어온 raw event를 사용하므로 첫 1건 도착 전엔 canonical/hints만 노출됨 — 의도된 단계적 풍부화.
+- **파일**: `apps/admin_web/src/styles.css`, `apps/admin_web/src/views/ChartsView.tsx`, `apps/admin_web/src/App.tsx`, `packages/contracts/event_schemas.py`, `apps/collector/service.py`, `src/web_app.py`, `tests/test_event_field_schemas.py`, `src/web/admin_dist/*` (rebuilt).

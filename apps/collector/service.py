@@ -79,6 +79,7 @@ from packages.contracts.admin import (
     IndicatorScriptSpec,
     param_values_from_dict,
 )
+from packages.contracts.event_schemas import canonical_event_field_schema
 from packages.contracts.events import EventType
 from packages.contracts.topics import DASHBOARD_CONTROL_TOPIC
 from packages.domain.enums import Provider, external_provider_value
@@ -1079,6 +1080,17 @@ async def admin_charts_list_indicators(
                     }
                 )
     return JSONResponse({"indicators": items})
+
+
+@app.get("/admin/charts/event-schemas")
+async def admin_charts_event_schemas() -> JSONResponse:
+    """Canonical scalar field schema per event_name.
+
+    Drives the inspector field selector's *primary* (canonical) layer in
+    the priority chain: canonical → runtime declaration → sampled
+    payload → static field_hints.  Keys are wire event_name strings.
+    """
+    return JSONResponse({"schemas": canonical_event_field_schema()})
 
 
 # Event names for which a raw runtime event is forwarded over

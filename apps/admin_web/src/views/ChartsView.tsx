@@ -271,6 +271,112 @@ function extractScalar(payload: Record<string, unknown> | null | undefined, fiel
   return null;
 }
 
+// ─── Selector helpers (target-aware events + schema-aware fields) ────────
+
+export interface TargetCapabilityRef {
+  provider: string;
+  venue: string;
+  instrument_type: string;
+  supported_event_types: string[];
+}
+
+export interface TargetRef {
+  target_id: string;
+  instrument: { symbol: string; instrument_type?: string | null; venue?: string | null };
+  provider?: string | null;
+}
+
+/** Map a target → its source-capability row from the snapshot. */
+export function findCapabilityForTarget(
+  target: TargetRef | undefined,
+  capabilities: TargetCapabilityRef[],
+): TargetCapabilityRef | null {
+  if (!target) return null;
+  const provider = String(target.provider ?? '').toLowerCase();
+  const venue = String(target.instrument?.venue ?? '').toLowerCase();
+  const itype = String(target.instrument?.instrument_type ?? '').toLowerCase();
+  // Strict triple match first.
+  let hit = capabilities.find(
+    (c) => c.provider === provider && c.venue === venue && c.instrument_type === itype,
+  );
+  if (hit) return hit;
+  // Fallback: provider + instrument_type only (some legacy targets miss venue).
+  hit = capabilities.find((c) => c.provider === provider && c.instrument_type === itype);
+  return hit ?? null;
+}
+
+/** Intersect indicator-slot allowed events with the target's capability events. */
+export function computeAllowedEvents(
+  slotEventNames: readonly string[],
+  capability: TargetCapabilityRef | null,
+): string[] {
+  const slot = (slotEventNames ?? []).map(String);
+  if (!capability) return [...slot];
+  const capSet = new Set(capability.supported_event_types.map(String));
+  const filtered = slot.filter((e) => capSet.has(e));
+  // If the intersection is empty (e.g. capability missing for legacy
+  // targets) fall back to the slot list rather than disabling the UI.
+  return filtered.length > 0 ? filtered : [...slot];
+}
+
+/** Sample observed field names from any raw events seen for this target+event. */
+export function sampledPayloadFields(
+  target: TargetRef | undefined,
+  eventName: string,
+  rawEvents: Map<string, Array<Record<string, unknown>>>,
+): string[] {
+  if (!target || !eventName) return [];
+  const candidateKeys = [
+    `${target.target_id}:${eventName}`,
+    `${target.instrument.symbol}:${eventName}`,
+  ];
+  const out = new Set<string>();
+  const internal = new Set([
+    '__payload', 'symbol', 'event_name', 'timestamp', 'published_at', 'occurred_at',
+  ]);
+  for (const key of candidateKeys) {
+    const rows = rawEvents.get(key);
+    if (!rows || rows.length === 0) continue;
+    // Sample most recent few rows.
+    for (const row of rows.slice(-5)) {
+      const payload = ((row as any).__payload ?? row) as Record<string, unknown>;
+      for (const [k, v] of Object.entries(payload)) {
+        if (internal.has(k)) continue;
+        // Only surface scalar-projectable fields.
+        if (typeof v === 'number' || typeof v === 'string' || typeof v === 'boolean') {
+          out.add(k);
+        }
+      }
+    }
+  }
+  return Array.from(out);
+}
+
+/** Compute the field options for a slot using the documented priority chain. */
+export function computeAllowedFields(
+  eventName: string,
+  target: TargetRef | undefined,
+  declHints: readonly string[],
+  canonicalSchemas: Record<string, string[]>,
+  rawEvents: Map<string, Array<Record<string, unknown>>>,
+): { fields: string[]; layer: 'canonical' | 'runtime' | 'sampled' | 'hints' | 'empty' } {
+  if (!eventName) return { fields: [], layer: 'empty' };
+  // (a) canonical/contracts schema
+  const canonical = canonicalSchemas[eventName];
+  if (canonical && canonical.length > 0) return { fields: [...canonical], layer: 'canonical' };
+  // (b) runtime/indicator declaration: the IndicatorInputDecl ships
+  //     event_names + field_hints together, so when canonical is silent
+  //     we treat the declaration's hints as the runtime-decl layer.
+  //     (Distinguished from layer (d) only by event match: declHints
+  //     is provided per-slot already.)
+  // (c) sampled payload fields
+  const sampled = sampledPayloadFields(target, eventName, rawEvents);
+  if (sampled.length > 0) return { fields: sampled, layer: 'sampled' };
+  // (d) declaration field_hints fallback
+  if (declHints && declHints.length > 0) return { fields: [...declHints], layer: 'hints' };
+  return { fields: [], layer: 'empty' };
+}
+
 // ─── ChartPanel ───────────────────────────────────────────────────────────
 
 function ChartPanel({
@@ -499,14 +605,20 @@ function PanelInspector({
   panel,
   targets,
   indicators,
+  capabilities,
+  canonicalSchemas,
+  rawEvents,
   onChange,
   onDelete,
   onAddPanelScript,
   onSavePanelScript,
 }: {
   panel: ChartPanelSpec;
-  targets: Array<{ target_id: string; instrument: { symbol: string }; provider?: string | null }>;
+  targets: Array<{ target_id: string; instrument: { symbol: string; instrument_type?: string | null; venue?: string | null }; provider?: string | null }>;
   indicators: IndicatorCatalogEntry[];
+  capabilities: TargetCapabilityRef[];
+  canonicalSchemas: Record<string, string[]>;
+  rawEvents: Map<string, Array<Record<string, unknown>>>;
   onChange: (next: ChartPanelSpec) => void;
   onDelete: () => void;
   onAddPanelScript: () => void;
@@ -685,9 +797,40 @@ function PanelInspector({
                       event_name: inp.event_names[0] ?? '',
                       field_name: '',
                     };
+                    const slotTarget = targets.find((t) => t.target_id === slot.target_id);
+                    const capability = findCapabilityForTarget(slotTarget, capabilities);
+                    const allowedEvents = computeAllowedEvents(inp.event_names, capability);
+                    const fieldRes = computeAllowedFields(
+                      slot.event_name,
+                      slotTarget,
+                      inp.field_hints,
+                      canonicalSchemas,
+                      rawEvents,
+                    );
                     function patchSlot(patch: Partial<ChartInputBinding>) {
+                      const next = { ...slot, ...patch };
+                      // Cascade: target change → re-evaluate event; event change
+                      // (or stale event after target change) → re-evaluate field.
+                      const newTarget = targets.find((t) => t.target_id === next.target_id);
+                      const newCap = findCapabilityForTarget(newTarget, capabilities);
+                      const newAllowedEvents = computeAllowedEvents(inp.event_names, newCap);
+                      if (next.event_name && !newAllowedEvents.includes(next.event_name)) {
+                        next.event_name = newAllowedEvents[0] ?? '';
+                      }
+                      const newFieldRes = computeAllowedFields(
+                        next.event_name,
+                        newTarget,
+                        inp.field_hints,
+                        canonicalSchemas,
+                        rawEvents,
+                      );
+                      if (next.field_name && !newFieldRes.fields.includes(next.field_name)) {
+                        // Stale field: pick first canonical/runtime/sampled candidate
+                        // rather than holding a value the new event cannot supply.
+                        next.field_name = newFieldRes.fields[0] ?? '';
+                      }
                       const others = binding.input_bindings.filter((s) => s.slot_name !== inp.slot_name);
-                      updateBinding(idx, { input_bindings: [...others, { ...slot, ...patch }] });
+                      updateBinding(idx, { input_bindings: [...others, next] });
                     }
                     return (
                       <div key={inp.slot_name} className="binding-row-grid">
@@ -708,23 +851,27 @@ function PanelInspector({
                         <label className="field">
                           <span>event</span>
                           <select
-                            value={slot.event_name}
+                            value={allowedEvents.includes(slot.event_name) ? slot.event_name : ''}
                             onChange={(e) => patchSlot({ event_name: e.target.value })}
+                            disabled={allowedEvents.length === 0}
                           >
-                            {inp.event_names.map((e) => (
+                            {!allowedEvents.includes(slot.event_name) && (
+                              <option value="">— event —</option>
+                            )}
+                            {allowedEvents.map((e) => (
                               <option key={e} value={e}>{e}</option>
                             ))}
                           </select>
                         </label>
                         <label className="field" style={{ gridColumn: '1 / span 2' }}>
-                          <span>field</span>
+                          <span>field <small className="hint-inline">({fieldRes.layer})</small></span>
                           <input
-                            list={`hints-${binding.binding_id}-${inp.slot_name}`}
+                            list={`fields-${binding.binding_id}-${inp.slot_name}`}
                             value={slot.field_name}
                             onChange={(e) => patchSlot({ field_name: e.target.value })}
                           />
-                          <datalist id={`hints-${binding.binding_id}-${inp.slot_name}`}>
-                            {inp.field_hints.map((h) => (
+                          <datalist id={`fields-${binding.binding_id}-${inp.slot_name}`}>
+                            {fieldRes.fields.map((h) => (
                               <option key={h} value={h} />
                             ))}
                           </datalist>
@@ -916,13 +1063,12 @@ interface ChartsViewProps {
   }>;
   targets: Array<{
     target_id: string;
-    instrument: { symbol: string; instrument_type?: string | null };
+    instrument: { symbol: string; instrument_type?: string | null; venue?: string | null };
     provider?: string | null;
   }>;
 }
 
 export default function ChartsView({ capabilities, targets }: ChartsViewProps) {
-  void capabilities;
   const [panels, setPanels] = useState<ChartPanelSpec[]>([]);
   const [indicatorsByPanel, setIndicatorsByPanel] = useState<Map<string, IndicatorCatalogEntry[]>>(
     new Map(),
@@ -932,6 +1078,7 @@ export default function ChartsView({ capabilities, targets }: ChartsViewProps) {
   const [banner, setBanner] = useState('');
   const [bannerError, setBannerError] = useState(false);
   const [selectedPanelId, setSelectedPanelId] = useState<string | null>(null);
+  const [canonicalSchemas, setCanonicalSchemas] = useState<Record<string, string[]>>({});
 
   const [layout, setLayout] = useState<Layout[]>(
     () => loadLayout(LS_WORKING) ?? loadLayout(LS_PREFERRED) ?? DEFAULT_LAYOUT,
@@ -961,6 +1108,22 @@ export default function ChartsView({ capabilities, targets }: ChartsViewProps) {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // Canonical event-field schema (priority layer (a) for the field selector).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await apiJson<{ schemas: Record<string, string[]> }>(
+          '/api/admin/charts/event-schemas',
+        );
+        if (!cancelled) setCanonicalSchemas(resp.schemas ?? {});
+      } catch {
+        /* leave empty; downstream falls through to runtime/sampled/hints */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   // Per-panel indicators fetch (built-ins + panel scripts).
   useEffect(() => {
@@ -1323,6 +1486,9 @@ export default function ChartsView({ capabilities, targets }: ChartsViewProps) {
               panel={selectedPanel}
               targets={targets}
               indicators={indicatorsByPanel.get(selectedPanel.panel_id) ?? globalIndicators}
+              capabilities={capabilities}
+              canonicalSchemas={canonicalSchemas}
+              rawEvents={rawEvents}
               onChange={onInspectorChange}
               onDelete={() => void removePanel(selectedPanel.panel_id)}
               onAddPanelScript={() => { /* placeholder; editing gates by inspector state */ }}

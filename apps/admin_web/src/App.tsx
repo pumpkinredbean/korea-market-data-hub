@@ -1551,6 +1551,7 @@ export default function App() {
                     instrument: {
                       symbol: t.instrument.symbol,
                       instrument_type: t.instrument.instrument_type,
+                      venue: t.instrument.venue,
                     },
                     provider: t.provider,
                   }))}
