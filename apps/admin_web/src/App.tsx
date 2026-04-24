@@ -1554,7 +1554,10 @@ export default function App() {
                       venue: t.instrument.venue,
                     },
                     provider: t.provider,
+                    event_types: t.event_types,
+                    enabled: t.enabled,
                   }))}
+                  onRefresh={refreshSnapshot}
                 />
               }
             />

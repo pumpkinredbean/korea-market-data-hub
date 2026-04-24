@@ -262,13 +262,69 @@ function panelToWire(panel: ChartPanelSpec): unknown {
   };
 }
 
-function extractScalar(payload: Record<string, unknown> | null | undefined, fieldName: string): number | null {
-  if (!payload) return null;
-  if (fieldName && fieldName in payload) {
-    const v = Number(payload[fieldName]);
-    return Number.isFinite(v) ? v : null;
+function valueAtPath(payload: Record<string, unknown> | null | undefined, fieldName: string): unknown {
+  if (!payload || !fieldName) return null;
+  if (fieldName in payload) return payload[fieldName];
+  let cur: unknown = payload;
+  for (const part of fieldName.split('.')) {
+    if (!part) return null;
+    if (cur && typeof cur === 'object' && part in (cur as Record<string, unknown>)) {
+      cur = (cur as Record<string, unknown>)[part];
+    } else {
+      return null;
+    }
   }
-  return null;
+  return cur;
+}
+
+function extractScalar(payload: Record<string, unknown> | null | undefined, fieldName: string): number | null {
+  const v = Number(valueAtPath(payload, fieldName));
+  return Number.isFinite(v) ? v : null;
+}
+
+function scalarDottedPaths(payload: Record<string, unknown>, prefix = ''): string[] {
+  const out: string[] = [];
+  for (const [k, v] of Object.entries(payload)) {
+    if (!k) continue;
+    const path = prefix ? `${prefix}.${k}` : k;
+    if (typeof v === 'number' || typeof v === 'string' || typeof v === 'boolean') {
+      out.push(path);
+    } else if (v && typeof v === 'object' && !Array.isArray(v)) {
+      out.push(...scalarDottedPaths(v as Record<string, unknown>, path));
+    }
+  }
+  return out;
+}
+
+function uniqueOrdered(values: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const v of values) {
+    if (!v || seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+  }
+  return out;
+}
+
+function preferRawPaths(fields: string[]): string[] {
+  const priority = (f: string) => {
+    if (f.startsWith('normalized.')) return 0;
+    if (f.startsWith('raw.info.')) return 1;
+    if (f.startsWith('raw.')) return 2;
+    return 3;
+  };
+  return uniqueOrdered(fields).sort((a, b) => priority(a) - priority(b) || a.localeCompare(b));
+}
+
+function syncRawFieldParam(binding: ChartSeriesBinding, slots: ChartInputBinding[]): Record<string, unknown> {
+  if (binding.indicator_ref !== 'builtin.raw') return binding.param_values;
+  const source = slots.find((s) => s.slot_name === 'source') ?? slots[0];
+  return { ...binding.param_values, field: source?.field_name ?? '' };
+}
+
+function isFieldParamHidden(binding: ChartSeriesBinding, paramName: string): boolean {
+  return binding.indicator_ref === 'builtin.raw' && paramName === 'field';
 }
 
 // ─── Selector helpers (target-aware events + schema-aware fields) ────────
@@ -284,6 +340,8 @@ export interface TargetRef {
   target_id: string;
   instrument: { symbol: string; instrument_type?: string | null; venue?: string | null };
   provider?: string | null;
+  event_types?: string[];
+  enabled?: boolean;
 }
 
 /** Map a target → its source-capability row from the snapshot. */
@@ -308,15 +366,14 @@ export function findCapabilityForTarget(
 /** Intersect indicator-slot allowed events with the target's capability events. */
 export function computeAllowedEvents(
   slotEventNames: readonly string[],
+  target: TargetRef | undefined,
   capability: TargetCapabilityRef | null,
 ): string[] {
   const slot = (slotEventNames ?? []).map(String);
-  if (!capability) return [...slot];
+  if (!target || target.enabled === false || !capability) return [];
   const capSet = new Set(capability.supported_event_types.map(String));
-  const filtered = slot.filter((e) => capSet.has(e));
-  // If the intersection is empty (e.g. capability missing for legacy
-  // targets) fall back to the slot list rather than disabling the UI.
-  return filtered.length > 0 ? filtered : [...slot];
+  const enabledSet = new Set((target.event_types ?? []).map(String));
+  return slot.filter((e) => capSet.has(e) && (enabledSet.size === 0 || enabledSet.has(e)));
 }
 
 /** Sample observed field names from any raw events seen for this target+event. */
@@ -337,17 +394,15 @@ export function sampledPayloadFields(
   for (const key of candidateKeys) {
     const rows = rawEvents.get(key);
     if (!rows || rows.length === 0) continue;
-    // Sample most recent few rows.
-    for (const row of rows.slice(-5)) {
-      const payload = ((row as any).__payload ?? row) as Record<string, unknown>;
-      for (const [k, v] of Object.entries(payload)) {
-        if (internal.has(k)) continue;
-        // Only surface scalar-projectable fields.
-        if (typeof v === 'number' || typeof v === 'string' || typeof v === 'boolean') {
-          out.add(k);
+      // Sample most recent few rows.
+      for (const row of rows.slice(-5)) {
+        const payload = ((row as any).__payload ?? row) as Record<string, unknown>;
+        for (const path of scalarDottedPaths(payload)) {
+          const top = path.split('.')[0];
+          if (internal.has(top)) continue;
+          out.add(path);
         }
       }
-    }
   }
   return Array.from(out);
 }
@@ -360,8 +415,12 @@ export function computeAllowedFields(
   canonicalSchemas: Record<string, string[]>,
   rawEvents: Map<string, Array<Record<string, unknown>>>,
 ): { fields: string[]; layer: 'canonical' | 'runtime' | 'sampled' | 'hints' | 'empty' } {
-  if (!eventName) return { fields: [], layer: 'empty' };
-  // (a) canonical/contracts schema
+  if (!target || !eventName) return { fields: [], layer: 'empty' };
+  // (a) sampled payload fields: prefer observed runtime scalar paths,
+  // including nested CCXT raw-only fields such as raw.info.lastPrice.
+  const sampled = preferRawPaths(sampledPayloadFields(target, eventName, rawEvents));
+  if (sampled.length > 0) return { fields: sampled, layer: 'sampled' };
+  // (b) canonical/contracts schema fallback
   const canonical = canonicalSchemas[eventName];
   if (canonical && canonical.length > 0) return { fields: [...canonical], layer: 'canonical' };
   // (b) runtime/indicator declaration: the IndicatorInputDecl ships
@@ -369,9 +428,6 @@ export function computeAllowedFields(
   //     we treat the declaration's hints as the runtime-decl layer.
   //     (Distinguished from layer (d) only by event match: declHints
   //     is provided per-slot already.)
-  // (c) sampled payload fields
-  const sampled = sampledPayloadFields(target, eventName, rawEvents);
-  if (sampled.length > 0) return { fields: sampled, layer: 'sampled' };
   // (d) declaration field_hints fallback
   if (declHints && declHints.length > 0) return { fields: [...declHints], layer: 'hints' };
   return { fields: [], layer: 'empty' };
@@ -486,7 +542,7 @@ function ChartPanel({
         if (slot && slot.target_id) {
           const key = `${slot.target_id}:${slot.event_name || 'trade'}`;
           const rows = rawEvents.get(key) ?? [];
-          const field = String(binding.param_values.field ?? slot.field_name ?? '');
+          const field = String(slot.field_name ?? binding.param_values.field ?? '');
           data = rows
             .map((r) => {
               const ts = (r as any).timestamp ?? (r as any).published_at;
@@ -648,9 +704,9 @@ function PanelInspector({
       indicator_ref: 'builtin.raw',
       instance_id: '',
       input_bindings: [
-        { slot_name: 'source', target_id: targets[0]?.target_id ?? '', event_name: 'trade', field_name: 'price' },
+        { slot_name: 'source', target_id: '', event_name: '', field_name: '' },
       ],
-      param_values: { field: 'price' },
+      param_values: { field: '' },
       output_name: 'value',
       axis: 'left',
       color: '',
@@ -764,9 +820,9 @@ function PanelInspector({
                     for (const p of d?.params ?? []) defaults[p.name] = p.default;
                     const slots = (d?.inputs ?? []).map((inp) => ({
                       slot_name: inp.slot_name,
-                      target_id: targets[0]?.target_id ?? '',
-                      event_name: inp.event_names[0] ?? '',
-                      field_name: inp.field_hints[0] ?? '',
+                      target_id: '',
+                      event_name: '',
+                      field_name: '',
                     }));
                     updateBinding(idx, {
                       indicator_ref: ref,
@@ -794,12 +850,12 @@ function PanelInspector({
                     const slot = binding.input_bindings.find((s) => s.slot_name === inp.slot_name) ?? {
                       slot_name: inp.slot_name,
                       target_id: '',
-                      event_name: inp.event_names[0] ?? '',
+                      event_name: '',
                       field_name: '',
                     };
                     const slotTarget = targets.find((t) => t.target_id === slot.target_id);
                     const capability = findCapabilityForTarget(slotTarget, capabilities);
-                    const allowedEvents = computeAllowedEvents(inp.event_names, capability);
+                    const allowedEvents = computeAllowedEvents(inp.event_names, slotTarget, capability);
                     const fieldRes = computeAllowedFields(
                       slot.event_name,
                       slotTarget,
@@ -813,9 +869,15 @@ function PanelInspector({
                       // (or stale event after target change) → re-evaluate field.
                       const newTarget = targets.find((t) => t.target_id === next.target_id);
                       const newCap = findCapabilityForTarget(newTarget, capabilities);
-                      const newAllowedEvents = computeAllowedEvents(inp.event_names, newCap);
-                      if (next.event_name && !newAllowedEvents.includes(next.event_name)) {
+                      const newAllowedEvents = computeAllowedEvents(inp.event_names, newTarget, newCap);
+                      if (!newTarget) {
+                        next.event_name = '';
+                        next.field_name = '';
+                      } else if (!next.event_name || !newAllowedEvents.includes(next.event_name)) {
                         next.event_name = newAllowedEvents[0] ?? '';
+                        next.field_name = '';
+                      } else if ('event_name' in patch) {
+                        next.field_name = '';
                       }
                       const newFieldRes = computeAllowedFields(
                         next.event_name,
@@ -824,13 +886,19 @@ function PanelInspector({
                         canonicalSchemas,
                         rawEvents,
                       );
-                      if (next.field_name && !newFieldRes.fields.includes(next.field_name)) {
+                      if (!next.field_name && newFieldRes.fields.length > 0 && ('event_name' in patch || 'target_id' in patch)) {
+                        next.field_name = newFieldRes.fields[0] ?? '';
+                      } else if (next.field_name && !newFieldRes.fields.includes(next.field_name)) {
                         // Stale field: pick first canonical/runtime/sampled candidate
                         // rather than holding a value the new event cannot supply.
                         next.field_name = newFieldRes.fields[0] ?? '';
                       }
                       const others = binding.input_bindings.filter((s) => s.slot_name !== inp.slot_name);
-                      updateBinding(idx, { input_bindings: [...others, next] });
+                      const input_bindings = [...others, next];
+                      updateBinding(idx, {
+                        input_bindings,
+                        param_values: syncRawFieldParam(binding, input_bindings),
+                      });
                     }
                     return (
                       <div key={inp.slot_name} className="binding-row-grid">
@@ -853,10 +921,10 @@ function PanelInspector({
                           <select
                             value={allowedEvents.includes(slot.event_name) ? slot.event_name : ''}
                             onChange={(e) => patchSlot({ event_name: e.target.value })}
-                            disabled={allowedEvents.length === 0}
+                            disabled={!slotTarget || allowedEvents.length === 0}
                           >
                             {!allowedEvents.includes(slot.event_name) && (
-                              <option value="">— event —</option>
+                              <option value="">{slotTarget ? '— event —' : '— select target first —'}</option>
                             )}
                             {allowedEvents.map((e) => (
                               <option key={e} value={e}>{e}</option>
@@ -865,16 +933,18 @@ function PanelInspector({
                         </label>
                         <label className="field" style={{ gridColumn: '1 / span 2' }}>
                           <span>field <small className="hint-inline">({fieldRes.layer})</small></span>
-                          <input
-                            list={`fields-${binding.binding_id}-${inp.slot_name}`}
-                            value={slot.field_name}
+                          <select
+                            value={fieldRes.fields.includes(slot.field_name) ? slot.field_name : ''}
                             onChange={(e) => patchSlot({ field_name: e.target.value })}
-                          />
-                          <datalist id={`fields-${binding.binding_id}-${inp.slot_name}`}>
+                            disabled={!slotTarget || !slot.event_name || fieldRes.fields.length === 0}
+                          >
+                            {!fieldRes.fields.includes(slot.field_name) && (
+                              <option value="">{slotTarget && slot.event_name ? '— field —' : '— select target/event first —'}</option>
+                            )}
                             {fieldRes.fields.map((h) => (
-                              <option key={h} value={h} />
+                              <option key={h} value={h}>{h}</option>
                             ))}
-                          </datalist>
+                          </select>
                         </label>
                       </div>
                     );
@@ -883,10 +953,10 @@ function PanelInspector({
               )}
 
               {/* Params */}
-              {decl && decl.params.length > 0 && (
+              {decl && decl.params.some((p) => !isFieldParamHidden(binding, p.name)) && (
                 <div className="field">
                   <span>Params</span>
-                  {decl.params.map((p) => (
+                  {decl.params.filter((p) => !isFieldParamHidden(binding, p.name)).map((p) => (
                     <label key={p.name} className="field">
                       <span>{p.label || p.name}</span>
                       <ParamWidget
@@ -1065,10 +1135,13 @@ interface ChartsViewProps {
     target_id: string;
     instrument: { symbol: string; instrument_type?: string | null; venue?: string | null };
     provider?: string | null;
+    event_types?: string[];
+    enabled?: boolean;
   }>;
+  onRefresh?: () => void | Promise<void>;
 }
 
-export default function ChartsView({ capabilities, targets }: ChartsViewProps) {
+export default function ChartsView({ capabilities, targets, onRefresh }: ChartsViewProps) {
   const [panels, setPanels] = useState<ChartPanelSpec[]>([]);
   const [indicatorsByPanel, setIndicatorsByPanel] = useState<Map<string, IndicatorCatalogEntry[]>>(
     new Map(),
@@ -1108,6 +1181,10 @@ export default function ChartsView({ capabilities, targets }: ChartsViewProps) {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    void onRefresh?.();
+  }, [onRefresh]);
 
   // Canonical event-field schema (priority layer (a) for the field selector).
   useEffect(() => {

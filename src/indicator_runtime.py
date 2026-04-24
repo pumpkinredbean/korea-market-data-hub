@@ -127,16 +127,30 @@ class RawPassthroughIndicator(HubIndicator):
         "funding_rate": "rate",
     }
 
+    @staticmethod
+    def _value_at_path(payload: dict[str, Any], field: str) -> Any:
+        if not field:
+            return None
+        if field in payload:
+            return payload[field]
+        cur: Any = payload
+        for part in field.split("."):
+            if not part:
+                return None
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                return None
+        return cur
+
     def on_event(self, event: dict[str, Any]) -> SeriesPoint | None:
         payload = event.get("payload") or {}
         if not isinstance(payload, dict):
             return None
         event_type = str(event.get("event_type") or "")
         field = str(self.params.get("field") or self.DEFAULT_FIELDS.get(event_type) or "")
-        raw: Any = None
-        if field and field in payload:
-            raw = payload[field]
-        else:
+        raw = self._value_at_path(payload, field)
+        if raw is None:
             for fallback in ("price", "close", "value", "rate", "mark_price"):
                 if fallback in payload:
                     raw = payload[fallback]

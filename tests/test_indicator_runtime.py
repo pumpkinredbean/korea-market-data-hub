@@ -223,6 +223,25 @@ class RawPassthroughTests(unittest.TestCase):
         assert out is not None
         self.assertEqual(out.value, 1.5)
 
+    def test_raw_passthrough_supports_dotted_payload_path(self) -> None:
+        from src.indicator_runtime import RawPassthroughIndicator
+
+        ind = RawPassthroughIndicator(field="raw.info.lastPrice")
+        out = ind.on_event({
+            "event_type": "trade",
+            "symbol": "BTC/USDT",
+            "market_scope": "",
+            "payload": {
+                "normalized": {"price": "123.4"},
+                "raw": {"price": "123.3", "info": {"lastPrice": "123.45"}},
+            },
+            "published_at": "2026-04-21T12:00:00+00:00",
+        })
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertEqual(out.value, 123.45)
+        self.assertEqual(out.meta["field"], "raw.info.lastPrice")
+
 
 if __name__ == "__main__":
     unittest.main()
