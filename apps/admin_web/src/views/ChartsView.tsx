@@ -142,11 +142,13 @@ interface IndicatorOutputEnvelope {
 // ─── LocalStorage keys ───────────────────────────────────────────────────
 
 const LS_PREFIX = 'korea-market-data-hub.admin-charts';
-const LS_PREFERRED = `${LS_PREFIX}.preferredLayout.v1`;
-const LS_WORKING = `${LS_PREFIX}.workingLayout.v1`;
-const LS_SEED_DONE = `${LS_PREFIX}.seed.v3.done`;
+const LS_PREFERRED = `${LS_PREFIX}.preferredLayout.v4`;
+const LS_WORKING = `${LS_PREFIX}.workingLayout.v4`;
+const LS_SEED_DONE = `${LS_PREFIX}.seed.v4.done`;
 
 const DEFAULT_LAYOUT: Layout[] = [];
+const CHART_LAYOUT_COLS = 12;
+const MIN_CHART_LAYOUT_H = 14;
 const DEFAULT_COLORS = ['#4aa3ff', '#f59e0b', '#22c55e', '#ef4444', '#a855f7', '#14b8a6'];
 
 const ResponsiveGridLayout = WidthProvider(GridLayout);
@@ -173,12 +175,25 @@ function uid(prefix: string): string {
   return `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+export function clampChartLayoutItem(item: Layout): Layout {
+  return {
+    ...item,
+    x: 0,
+    w: CHART_LAYOUT_COLS,
+    h: Math.max(MIN_CHART_LAYOUT_H, Number(item.h) || MIN_CHART_LAYOUT_H),
+  };
+}
+
+export function clampChartLayout(layout: Layout[]): Layout[] {
+  return layout.map(clampChartLayoutItem);
+}
+
 function loadLayout(key: string): Layout[] | null {
   try {
     const raw = localStorage.getItem(key);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) return parsed as Layout[];
+    if (Array.isArray(parsed)) return clampChartLayout(parsed as Layout[]);
   } catch {
     /* ignore */
   }
@@ -187,7 +202,7 @@ function loadLayout(key: string): Layout[] | null {
 
 function saveLayout(key: string, layout: Layout[]): void {
   try {
-    localStorage.setItem(key, JSON.stringify(layout));
+    localStorage.setItem(key, JSON.stringify(clampChartLayout(layout)));
   } catch {
     /* ignore */
   }
@@ -334,14 +349,19 @@ function uniqueOrdered(values: string[]): string[] {
   return out;
 }
 
+function withCurrentCandidate(fields: string[], current: string): string[] {
+  if (!current || current.startsWith('normalized.')) return fields;
+  return uniqueOrdered([...fields, current]);
+}
+
 function preferRawPaths(fields: string[]): string[] {
   const priority = (f: string) => {
-    if (f.startsWith('normalized.')) return 0;
     if (f.startsWith('raw.info.')) return 1;
     if (f.startsWith('raw.')) return 2;
     return 3;
   };
-  return uniqueOrdered(fields).sort((a, b) => priority(a) - priority(b) || a.localeCompare(b));
+  return uniqueOrdered(fields.filter((f) => !f.startsWith('normalized.')))
+    .sort((a, b) => priority(a) - priority(b) || a.localeCompare(b));
 }
 
 function syncRawFieldParam(binding: ChartSeriesBinding, slots: ChartInputBinding[]): Record<string, unknown> {
@@ -427,6 +447,7 @@ export function sampledPayloadFields(
         for (const path of scalarDottedPaths(payload)) {
           const top = path.split('.')[0];
           if (internal.has(top)) continue;
+          if (top === 'normalized') continue;
           out.add(path);
         }
       }
@@ -436,11 +457,11 @@ export function sampledPayloadFields(
 
 const TIME_FIELD_PRIORITY = [
   'timestamp', 'published_at', 'occurred_at', 'time', 'datetime', 'open_time_ms', 'close_time_ms',
-  'normalized.occurred_at', 'normalized.timestamp', 'raw.timestamp', 'raw.datetime',
-  'raw.info.E', 'raw.info.T', 'raw.info.t',
+  'raw.timestamp', 'raw.datetime', 'raw.info.E', 'raw.info.T', 'raw.info.t',
 ];
 
 function isTimeLikePath(path: string): boolean {
+  if (path.startsWith('normalized.')) return false;
   if (TIME_FIELD_PRIORITY.includes(path)) return true;
   const leaf = path.split('.').pop()?.toLowerCase() ?? '';
   if (path.startsWith('raw.info.')) return ['raw.info.E', 'raw.info.T', 'raw.info.t'].includes(path);
@@ -842,6 +863,7 @@ function PanelInspector({
 
   const baseTarget = targets.find((t) => t.target_id === (panel.base_feed?.target_id ?? ''));
   const baseTimeRes = computeAllowedTimeFields(panel.base_feed?.event_name ?? '', baseTarget, rawEvents);
+  const baseTimeFields = withCurrentCandidate(baseTimeRes.fields, panel.base_feed?.time_field_name ?? '');
 
   return (
     <div className="charts-inspector">
@@ -905,14 +927,14 @@ function PanelInspector({
           <label className="field">
             <span>x/time field <small className="hint-inline">({baseTimeRes.layer})</small></span>
             <select
-              value={baseTimeRes.fields.includes(panel.base_feed?.time_field_name ?? '') ? panel.base_feed?.time_field_name ?? '' : ''}
+              value={baseTimeFields.includes(panel.base_feed?.time_field_name ?? '') ? panel.base_feed?.time_field_name ?? '' : ''}
               onChange={(e) => setBaseFeed({ time_field_name: e.target.value })}
-              disabled={!baseTarget || !(panel.base_feed?.event_name) || baseTimeRes.fields.length === 0}
+              disabled={!baseTarget || !(panel.base_feed?.event_name) || baseTimeFields.length === 0}
             >
-              {!baseTimeRes.fields.includes(panel.base_feed?.time_field_name ?? '') && (
+              {!baseTimeFields.includes(panel.base_feed?.time_field_name ?? '') && (
                 <option value="">{baseTarget && panel.base_feed?.event_name ? '— x/time field —' : '— select target/event first —'}</option>
               )}
-              {baseTimeRes.fields.map((h) => (
+              {baseTimeFields.map((h) => (
                 <option key={h} value={h}>{h}</option>
               ))}
             </select>
@@ -1001,6 +1023,8 @@ function PanelInspector({
                       rawEvents,
                     );
                     const timeFieldRes = computeAllowedTimeFields(slot.event_name, slotTarget, rawEvents);
+                    const timeFields = withCurrentCandidate(timeFieldRes.fields, slot.time_field_name);
+                    const valueFields = withCurrentCandidate(fieldRes.fields, slot.field_name);
                     function patchSlot(patch: Partial<ChartInputBinding>) {
                       const next = { ...slot, ...patch };
                       // Cascade: target change → re-evaluate event; event change
@@ -1081,14 +1105,14 @@ function PanelInspector({
                         <label className="field">
                           <span>x/time field <small className="hint-inline">({timeFieldRes.layer})</small></span>
                           <select
-                            value={timeFieldRes.fields.includes(slot.time_field_name) ? slot.time_field_name : ''}
+                            value={timeFields.includes(slot.time_field_name) ? slot.time_field_name : ''}
                             onChange={(e) => patchSlot({ time_field_name: e.target.value })}
-                            disabled={!slotTarget || !slot.event_name || timeFieldRes.fields.length === 0}
+                            disabled={!slotTarget || !slot.event_name || timeFields.length === 0}
                           >
-                            {!timeFieldRes.fields.includes(slot.time_field_name) && (
+                            {!timeFields.includes(slot.time_field_name) && (
                               <option value="">{slotTarget && slot.event_name ? '— x/time field —' : '— select target/event first —'}</option>
                             )}
-                            {timeFieldRes.fields.map((h) => (
+                            {timeFields.map((h) => (
                               <option key={h} value={h}>{h}</option>
                             ))}
                           </select>
@@ -1096,14 +1120,14 @@ function PanelInspector({
                         <label className="field">
                           <span>y/value field <small className="hint-inline">({fieldRes.layer})</small></span>
                           <select
-                            value={fieldRes.fields.includes(slot.field_name) ? slot.field_name : ''}
+                            value={valueFields.includes(slot.field_name) ? slot.field_name : ''}
                             onChange={(e) => patchSlot({ field_name: e.target.value })}
-                            disabled={!slotTarget || !slot.event_name || fieldRes.fields.length === 0}
+                            disabled={!slotTarget || !slot.event_name || valueFields.length === 0}
                           >
-                            {!fieldRes.fields.includes(slot.field_name) && (
+                            {!valueFields.includes(slot.field_name) && (
                               <option value="">{slotTarget && slot.event_name ? '— field —' : '— select target/event first —'}</option>
                             )}
-                            {fieldRes.fields.map((h) => (
+                            {valueFields.map((h) => (
                               <option key={h} value={h}>{h}</option>
                             ))}
                           </select>
@@ -1316,7 +1340,7 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
   const [canonicalSchemas, setCanonicalSchemas] = useState<Record<string, string[]>>({});
 
   const [layout, setLayout] = useState<Layout[]>(
-    () => loadLayout(LS_WORKING) ?? loadLayout(LS_PREFERRED) ?? DEFAULT_LAYOUT,
+    () => clampChartLayout(loadLayout(LS_WORKING) ?? loadLayout(LS_PREFERRED) ?? DEFAULT_LAYOUT),
   );
 
   const [indicatorOutputs, setIndicatorOutputs] = useState<Map<string, SeriesPoint[]>>(new Map());
@@ -1494,16 +1518,16 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
       for (const panel of panels) {
         const existing = byId.get(panel.panel_id);
         if (existing) {
-          merged.push(existing);
+          merged.push(clampChartLayoutItem(existing));
         } else {
-          merged.push({
+          merged.push(clampChartLayoutItem({
             i: panel.panel_id,
             x: panel.x ?? 0,
             y: nextY,
-            w: Math.max(6, panel.w ?? 12),
-            h: Math.max(8, panel.h ?? 14),
-          });
-          nextY += Math.max(8, panel.h ?? 14);
+            w: panel.w ?? CHART_LAYOUT_COLS,
+            h: panel.h ?? MIN_CHART_LAYOUT_H,
+          }));
+          nextY += Math.max(MIN_CHART_LAYOUT_H, panel.h ?? MIN_CHART_LAYOUT_H);
         }
       }
       return merged;
@@ -1511,7 +1535,7 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
   }, [panels]);
 
   useEffect(() => {
-    saveLayout(LS_WORKING, layout);
+    saveLayout(LS_WORKING, clampChartLayout(layout));
   }, [layout]);
 
   // First-run seeder (v3).
@@ -1632,7 +1656,7 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
   }
 
   function savePreferredLayout() {
-    saveLayout(LS_PREFERRED, layout);
+    saveLayout(LS_PREFERRED, clampChartLayout(layout));
     setBanner('선호 레이아웃 저장됨.');
     setBannerError(false);
   }
@@ -1640,7 +1664,7 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
   function restorePreferredLayout() {
     const preferred = loadLayout(LS_PREFERRED);
     if (preferred) {
-      setLayout(preferred);
+      setLayout(clampChartLayout(preferred));
       setBanner('선호 레이아웃 복원됨.');
       setBannerError(false);
     }
@@ -1686,10 +1710,10 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
             <ResponsiveGridLayout
               key={layoutKey}
               className="layout"
-              cols={12}
+              cols={CHART_LAYOUT_COLS}
               rowHeight={40}
               layout={layout}
-              onLayoutChange={(next) => setLayout(next)}
+              onLayoutChange={(next) => setLayout(clampChartLayout(next))}
               draggableHandle=".panel-drag-handle"
               isDraggable
               isResizable

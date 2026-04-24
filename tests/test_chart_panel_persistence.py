@@ -5,9 +5,68 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 class ChartsStateRoundTripTests(unittest.IsolatedAsyncioTestCase):
+    async def test_service_put_and_list_preserve_input_and_base_time_field(self) -> None:
+        from apps.collector import service
+        from src.indicator_runtime import ChartsStateStore
+
+        class Request:
+            async def json(self) -> dict:
+                return {
+                    "panel_id": "p-service-time",
+                    "chart_type": "candle",
+                    "symbol": "BTCUSDT",
+                    "base_feed": {
+                        "target_id": "t-btc",
+                        "event_name": "ohlcv",
+                        "time_field_name": "raw.timestamp",
+                    },
+                    "series_bindings": [
+                        {
+                            "binding_id": "b1",
+                            "indicator_ref": "builtin.raw",
+                            "input_bindings": [
+                                {
+                                    "slot_name": "source",
+                                    "target_id": "t-btc",
+                                    "event_name": "trade",
+                                    "time_field_name": "raw.info.T",
+                                    "field_name": "raw.price",
+                                }
+                            ],
+                            "param_values": [["field", "raw.price"], ["time_field", "raw.info.T"]],
+                            "output_name": "value",
+                        }
+                    ],
+                }
+
+        class RuntimeManager:
+            async def reconcile(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ChartsStateStore(path=Path(tmp) / "admin_charts.json")
+            with patch.object(service, "charts_state_store", store), patch.object(
+                service, "indicator_runtime_manager", RuntimeManager()
+            ):
+                put_resp = await service.admin_charts_upsert_panel(Request())  # type: ignore[arg-type]
+                put_body = json.loads(put_resp.body)
+                self.assertEqual(put_body["panel"]["base_feed"]["time_field_name"], "raw.timestamp")
+                slot = put_body["panel"]["series_bindings"][0]["input_bindings"][0]
+                self.assertEqual(slot["time_field_name"], "raw.info.T")
+
+                list_resp = await service.admin_charts_list_panels()
+                list_body = json.loads(list_resp.body)
+                panel = list_body["panels"][0]
+                self.assertEqual(panel["base_feed"]["time_field_name"], "raw.timestamp")
+                self.assertEqual(
+                    panel["series_bindings"][0]["input_bindings"][0]["time_field_name"],
+                    "raw.info.T",
+                )
+
     async def test_panel_with_new_shape_round_trips_through_snapshot(self) -> None:
         from packages.contracts.admin import (
             ChartInputSlot,

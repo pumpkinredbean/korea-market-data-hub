@@ -814,6 +814,7 @@ async def admin_charts_upsert_panel(request: Request) -> JSONResponse:
                     slot_name=str(slot.get("slot_name") or "") if isinstance(slot, dict) else "",
                     target_id=str(slot.get("target_id") or "") if isinstance(slot, dict) else "",
                     event_name=str(slot.get("event_name") or "") if isinstance(slot, dict) else "",
+                    time_field_name=str(slot.get("time_field_name") or "") if isinstance(slot, dict) else "",
                     field_name=str(slot.get("field_name") or "") if isinstance(slot, dict) else "",
                 )
                 for slot in input_bindings_raw
@@ -842,6 +843,7 @@ async def admin_charts_upsert_panel(request: Request) -> JSONResponse:
             base_feed = ChartPanelBaseFeed(
                 target_id=str(base_feed_raw.get("target_id") or ""),
                 event_name=str(base_feed_raw.get("event_name") or "ohlcv"),
+                time_field_name=str(base_feed_raw.get("time_field_name") or ""),
             )
 
         # Panel-scoped scripts + instances (optional).
@@ -1117,6 +1119,7 @@ def _format_admin_charts_raw_event_frame(event: Any) -> str:
     without spinning up the full SSE generator.
     """
     payload = dict(getattr(event, "payload", {}) or {})
+    payload.pop("normalized", None)
     published_at = getattr(event, "published_at", None)
     # The raw OHLCV/trade payloads carry their own ``occurred_at`` which
     # the frontend prefers as the candle timestamp. Copy it up to

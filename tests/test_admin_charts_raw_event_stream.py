@@ -85,6 +85,7 @@ class FormatRawEventFrameTests(unittest.TestCase):
         data_line = next(line for line in frame.split("\n") if line.startswith("data: "))
         data = json.loads(data_line[len("data: "):])
         self.assertEqual(data["payload"]["raw"]["info"]["foo"], "bar")
+        self.assertNotIn("normalized", data["payload"])
 
 
 class AdminChartsStreamRealFanOutTests(unittest.IsolatedAsyncioTestCase):

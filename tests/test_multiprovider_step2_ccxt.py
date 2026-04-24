@@ -155,6 +155,7 @@ class RuntimeCryptoBranchTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("raw_symbol", ev)
             control_payload = ev["control_plane_payload"]
             self.assertEqual(control_payload["raw"]["info"]["foo"], "bar")
+            self.assertNotIn("normalized", control_payload)
             for forbidden in _FORBIDDEN_KOREAN:
                 self.assertNotIn(forbidden, _stringified(control_payload))
         finally:
@@ -194,7 +195,7 @@ class RuntimeCryptoBranchTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(events, "expected at least one order book event")
             control_payload = events[0]["control_plane_payload"]
             self.assertEqual(control_payload["raw"]["info"]["foo"], "book")
-            self.assertEqual(control_payload["normalized"]["asks"], [[101, 2]])
+            self.assertNotIn("normalized", control_payload)
             for forbidden in _FORBIDDEN_KOREAN:
                 self.assertNotIn(forbidden, _stringified(control_payload))
         finally:

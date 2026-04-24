@@ -242,6 +242,19 @@ class RawPassthroughTests(unittest.TestCase):
         self.assertEqual(out.value, 123.45)
         self.assertEqual(out.meta["field"], "raw.info.lastPrice")
 
+    def test_raw_passthrough_does_not_fallback_to_normalized_payload(self) -> None:
+        from src.indicator_runtime import RawPassthroughIndicator
+
+        ind = RawPassthroughIndicator(field="price")
+        out = ind.on_event({
+            "event_type": "trade",
+            "symbol": "BTC/USDT",
+            "market_scope": "",
+            "payload": {"normalized": {"price": "123.4"}},
+            "published_at": "2026-04-21T12:00:00+00:00",
+        })
+        self.assertIsNone(out)
+
     def test_raw_passthrough_uses_dotted_time_field(self) -> None:
         from src.indicator_runtime import RawPassthroughIndicator
 

@@ -15,7 +15,7 @@ def test_field_binding_uses_strict_select_not_free_text_datalist() -> None:
     assert "<datalist" not in source
     assert "list={`fields-" not in source
     assert "— select target/event first —" in source
-    assert "disabled={!slotTarget || !slot.event_name || fieldRes.fields.length === 0}" in source
+    assert "disabled={!slotTarget || !slot.event_name || valueFields.length === 0}" in source
 
 
 def test_raw_binding_uses_slot_field_before_param_field_and_syncs_param() -> None:
@@ -36,7 +36,32 @@ def test_time_field_candidates_are_separate_from_value_fields() -> None:
     assert "price" not in source[source.index("const TIME_FIELD_PRIORITY"):source.index("function isTimeLikePath")]
     assert "x/time field" in source
     assert "y/value field" in source
-    assert "disabled={!slotTarget || !slot.event_name || timeFieldRes.fields.length === 0}" in source
+    assert "disabled={!slotTarget || !slot.event_name || timeFields.length === 0}" in source
+    assert "normalized." not in source[source.index("const TIME_FIELD_PRIORITY"):source.index("function isTimeLikePath")]
+
+
+def test_normalized_candidates_are_filtered_from_value_fields() -> None:
+    source = CHARTS_VIEW.read_text()
+
+    assert "!f.startsWith('normalized.')" in source
+    assert "if (top === 'normalized') continue;" in source
+
+
+def test_layout_storage_is_v4_and_clamped_full_width() -> None:
+    source = CHARTS_VIEW.read_text()
+
+    assert "preferredLayout.v4" in source
+    assert "workingLayout.v4" in source
+    assert "seed.v4.done" in source
+    assert "preferredLayout.v1" not in source
+    assert "workingLayout.v1" not in source
+    assert "seed.v3.done" not in source
+    assert "export function clampChartLayoutItem" in source
+    assert "x: 0" in source
+    assert "w: CHART_LAYOUT_COLS" in source
+    assert "h: Math.max(MIN_CHART_LAYOUT_H" in source
+    assert "setLayout(clampChartLayout(preferred))" in source
+    assert "onLayoutChange={(next) => setLayout(clampChartLayout(next))}" in source
 
 
 def test_chart_time_extraction_supports_selected_field_and_fallbacks() -> None:
