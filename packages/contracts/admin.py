@@ -148,6 +148,7 @@ class ChartInputSlot:
     slot_name: str
     target_id: str = ""
     event_name: str = ""
+    time_field_name: str = ""
     field_name: str = ""
 
 
@@ -162,6 +163,7 @@ class ChartPanelBaseFeed:
 
     target_id: str = ""
     event_name: str = "ohlcv"
+    time_field_name: str = ""
 
 
 @dataclass(frozen=True, slots=True)

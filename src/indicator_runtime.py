@@ -149,6 +149,7 @@ class RawPassthroughIndicator(HubIndicator):
             return None
         event_type = str(event.get("event_type") or "")
         field = str(self.params.get("field") or self.DEFAULT_FIELDS.get(event_type) or "")
+        time_field = str(self.params.get("time_field") or "")
         raw = self._value_at_path(payload, field)
         if raw is None:
             for fallback in ("price", "close", "value", "rate", "mark_price"):
@@ -160,16 +161,22 @@ class RawPassthroughIndicator(HubIndicator):
             value = float(raw)
         except (TypeError, ValueError):
             return None
-        timestamp = str(
-            payload.get("occurred_at")
-            or payload.get("timestamp")
-            or event.get("published_at")
-            or datetime.now(timezone.utc).isoformat()
-        )
+        time_raw = self._value_at_path(payload, time_field) if time_field else None
+        if time_raw is None:
+            time_field = ""
+            for fallback in ("timestamp", "published_at", "occurred_at"):
+                time_raw = payload.get(fallback)
+                if time_raw is not None:
+                    time_field = fallback
+                    break
+        if time_raw is None:
+            time_raw = event.get("published_at") or datetime.now(timezone.utc).isoformat()
+            time_field = "published_at"
+        timestamp = str(time_raw)
         return SeriesPoint(
             timestamp=timestamp,
             value=value,
-            meta={"field": field, "event_type": event_type},
+            meta={"field": field, "time_field": time_field, "event_type": event_type},
         )
 
 
@@ -193,6 +200,13 @@ _RAW_PASSTHROUGH_DECLARATION = IndicatorDeclaration(
             choices=("close", "open", "high", "low", "volume", "price", "value", "rate"),
             label="Field",
             help="Payload key to project as the line value.",
+        ),
+        IndicatorParamDecl(
+            name="time_field",
+            kind="str",
+            default="",
+            label="Time field",
+            help="Payload key/path to use as the x-axis timestamp.",
         ),
     ),
     outputs=(
@@ -949,7 +963,7 @@ def new_instance_id() -> str:
 
 
 _CHART_INPUT_SLOT_FIELDS: frozenset[str] = frozenset(
-    {"slot_name", "target_id", "event_name", "field_name"}
+    {"slot_name", "target_id", "event_name", "time_field_name", "field_name"}
 )
 
 _CHART_SERIES_BINDING_FIELDS: frozenset[str] = frozenset(
@@ -1020,17 +1034,24 @@ def _migrate_legacy_binding(entry: dict[str, Any]) -> dict[str, Any]:
         target_id = str(entry.get("target_id") or entry.get("symbol") or "")
         event_name = str(entry.get("event_name") or "trade")
         field_name = str(entry.get("field_name") or "")
+        time_field_name = str(entry.get("time_field_name") or "")
         new_entry["indicator_ref"] = "builtin.raw"
         new_entry["input_bindings"] = (
             {
                 "slot_name": "source",
                 "target_id": target_id,
                 "event_name": event_name,
+                "time_field_name": time_field_name,
                 "field_name": field_name,
             },
         )
+        params: list[tuple[str, Any]] = []
         if field_name:
-            new_entry["param_values"] = (("field", field_name),)
+            params.append(("field", field_name))
+        if time_field_name:
+            params.append(("time_field", time_field_name))
+        if params:
+            new_entry["param_values"] = tuple(params)
         new_entry["output_name"] = entry.get("output_name") or "value"
     else:  # builtin or script
         target_id = str(entry.get("target_id") or "")
@@ -1085,6 +1106,7 @@ def _base_feed_from_entry(entry: Any) -> ChartPanelBaseFeed | None:
     return ChartPanelBaseFeed(
         target_id=str(entry.get("target_id") or ""),
         event_name=str(entry.get("event_name") or "ohlcv"),
+        time_field_name=str(entry.get("time_field_name") or ""),
     )
 
 
@@ -1165,7 +1187,7 @@ def _panel_spec_from_entry(entry: dict) -> ChartPanelSpec:
             slot = first.input_bindings[0]
             if (slot.event_name or "ohlcv") == "ohlcv":
                 filtered["base_feed"] = ChartPanelBaseFeed(
-                    target_id=slot.target_id, event_name="ohlcv"
+                    target_id=slot.target_id, event_name="ohlcv", time_field_name=slot.time_field_name
                 )
                 filtered["series_bindings"] = filtered["series_bindings"][1:]
     return ChartPanelSpec(**filtered)

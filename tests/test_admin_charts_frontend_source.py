@@ -22,7 +22,30 @@ def test_raw_binding_uses_slot_field_before_param_field_and_syncs_param() -> Non
     source = CHARTS_VIEW.read_text()
 
     assert "slot.field_name ?? binding.param_values.field" in source
+    assert "slot.time_field_name ?? binding.param_values.time_field" in source
     assert "syncRawFieldParam(binding, input_bindings)" in source
+    assert "time_field: source?.time_field_name" in source
+
+
+def test_time_field_candidates_are_separate_from_value_fields() -> None:
+    source = CHARTS_VIEW.read_text()
+
+    assert "computeAllowedTimeFields" in source
+    assert "TIME_FIELD_PRIORITY" in source
+    assert "'raw.info.E', 'raw.info.T', 'raw.info.t'" in source
+    assert "price" not in source[source.index("const TIME_FIELD_PRIORITY"):source.index("function isTimeLikePath")]
+    assert "x/time field" in source
+    assert "y/value field" in source
+    assert "disabled={!slotTarget || !slot.event_name || timeFieldRes.fields.length === 0}" in source
+
+
+def test_chart_time_extraction_supports_selected_field_and_fallbacks() -> None:
+    source = CHARTS_VIEW.read_text()
+
+    assert "export function parseChartTime" in source
+    assert "raw < 10_000_000_000 ? raw * 1000 : raw" in source
+    assert "extractChartTime(r, spec.base_feed?.time_field_name)" in source
+    assert "extractChartTime(r, timeField)" in source
 
 
 def test_charts_grid_is_not_shrunk_by_inspector_column() -> None:

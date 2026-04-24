@@ -21,6 +21,7 @@ export interface ChartInputBinding {
   slot_name: string;
   target_id: string;
   event_name: string;
+  time_field_name: string;
   field_name: string;
 }
 
@@ -40,6 +41,7 @@ export interface ChartSeriesBinding {
 export interface ChartPanelBaseFeed {
   target_id: string;
   event_name: string;
+  time_field_name: string;
 }
 
 interface IndicatorScriptSpec {
@@ -223,6 +225,7 @@ function normalizePanel(raw: any): ChartPanelSpec {
       ? {
           target_id: raw.base_feed.target_id ?? '',
           event_name: raw.base_feed.event_name ?? 'ohlcv',
+          time_field_name: raw.base_feed.time_field_name ?? '',
         }
       : null,
     scripts: Array.isArray(raw.scripts) ? raw.scripts : [],
@@ -237,6 +240,7 @@ function normalizePanel(raw: any): ChartPanelSpec {
                 slot_name: s.slot_name ?? '',
                 target_id: s.target_id ?? '',
                 event_name: s.event_name ?? '',
+                time_field_name: s.time_field_name ?? '',
                 field_name: s.field_name ?? '',
               }))
             : [],
@@ -282,6 +286,29 @@ function extractScalar(payload: Record<string, unknown> | null | undefined, fiel
   return Number.isFinite(v) ? v : null;
 }
 
+export function parseChartTime(raw: unknown): UTCTimestamp | null {
+  if (raw == null || raw === '') return null;
+  let ms: number;
+  if (typeof raw === 'number') {
+    ms = raw < 10_000_000_000 ? raw * 1000 : raw;
+  } else if (typeof raw === 'string' && /^\d+(\.\d+)?$/.test(raw.trim())) {
+    const n = Number(raw.trim());
+    ms = n < 10_000_000_000 ? n * 1000 : n;
+  } else {
+    ms = new Date(String(raw)).getTime();
+  }
+  if (!Number.isFinite(ms)) return null;
+  return Math.floor(ms / 1000) as UTCTimestamp;
+}
+
+export function extractChartTime(row: Record<string, unknown>, timeFieldName?: string): UTCTimestamp | null {
+  const payload = ((row as any).__payload ?? row) as Record<string, unknown>;
+  const selected = timeFieldName ? valueAtPath(payload, timeFieldName) : null;
+  const raw = selected ?? (row as any).timestamp ?? (row as any).published_at ?? (row as any).occurred_at
+    ?? valueAtPath(payload, 'timestamp') ?? valueAtPath(payload, 'published_at') ?? valueAtPath(payload, 'occurred_at');
+  return parseChartTime(raw);
+}
+
 function scalarDottedPaths(payload: Record<string, unknown>, prefix = ''): string[] {
   const out: string[] = [];
   for (const [k, v] of Object.entries(payload)) {
@@ -320,11 +347,11 @@ function preferRawPaths(fields: string[]): string[] {
 function syncRawFieldParam(binding: ChartSeriesBinding, slots: ChartInputBinding[]): Record<string, unknown> {
   if (binding.indicator_ref !== 'builtin.raw') return binding.param_values;
   const source = slots.find((s) => s.slot_name === 'source') ?? slots[0];
-  return { ...binding.param_values, field: source?.field_name ?? '' };
+  return { ...binding.param_values, field: source?.field_name ?? '', time_field: source?.time_field_name ?? '' };
 }
 
 function isFieldParamHidden(binding: ChartSeriesBinding, paramName: string): boolean {
-  return binding.indicator_ref === 'builtin.raw' && paramName === 'field';
+  return binding.indicator_ref === 'builtin.raw' && (paramName === 'field' || paramName === 'time_field');
 }
 
 // ─── Selector helpers (target-aware events + schema-aware fields) ────────
@@ -405,6 +432,60 @@ export function sampledPayloadFields(
       }
   }
   return Array.from(out);
+}
+
+const TIME_FIELD_PRIORITY = [
+  'timestamp', 'published_at', 'occurred_at', 'time', 'datetime', 'open_time_ms', 'close_time_ms',
+  'normalized.occurred_at', 'normalized.timestamp', 'raw.timestamp', 'raw.datetime',
+  'raw.info.E', 'raw.info.T', 'raw.info.t',
+];
+
+function isTimeLikePath(path: string): boolean {
+  if (TIME_FIELD_PRIORITY.includes(path)) return true;
+  const leaf = path.split('.').pop()?.toLowerCase() ?? '';
+  if (path.startsWith('raw.info.')) return ['raw.info.E', 'raw.info.T', 'raw.info.t'].includes(path);
+  return leaf === 'timestamp' || leaf === 'datetime' || leaf === 'occurred_at' || leaf === 'published_at'
+    || leaf === 'time' || leaf === 'open_time_ms' || leaf === 'close_time_ms'
+}
+
+export function sampledTimeFields(
+  target: TargetRef | undefined,
+  eventName: string,
+  rawEvents: Map<string, Array<Record<string, unknown>>>,
+): string[] {
+  if (!target || !eventName) return [];
+  const candidateKeys = [`${target.target_id}:${eventName}`, `${target.instrument.symbol}:${eventName}`];
+  const out = new Set<string>();
+  for (const key of candidateKeys) {
+    const rows = rawEvents.get(key);
+    if (!rows || rows.length === 0) continue;
+    for (const row of rows.slice(-5)) {
+      for (const path of scalarDottedPaths(((row as any).__payload ?? row) as Record<string, unknown>)) {
+        if (isTimeLikePath(path)) out.add(path);
+      }
+    }
+  }
+  return Array.from(out);
+}
+
+export function computeAllowedTimeFields(
+  eventName: string,
+  target: TargetRef | undefined,
+  rawEvents: Map<string, Array<Record<string, unknown>>>,
+): { fields: string[]; layer: 'sampled' | 'fallback' | 'empty' } {
+  if (!target || !eventName) return { fields: [], layer: 'empty' };
+  const sampled = sampledTimeFields(target, eventName, rawEvents);
+  if (sampled.length > 0) {
+    return {
+      fields: uniqueOrdered(sampled).sort((a, b) => {
+        const ai = TIME_FIELD_PRIORITY.indexOf(a);
+        const bi = TIME_FIELD_PRIORITY.indexOf(b);
+        return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi) || a.localeCompare(b);
+      }),
+      layer: 'sampled',
+    };
+  }
+  return { fields: ['published_at'], layer: 'fallback' };
 }
 
 /** Compute the field options for a slot using the documented priority chain. */
@@ -511,25 +592,26 @@ function ChartPanel({
       }
       const key = `${spec.base_feed.target_id}:${spec.base_feed.event_name || 'ohlcv'}`;
       const rows = rawEvents.get(key) ?? [];
-      const data: CandlestickData[] = rows
-        .map((r) => {
-          const ts = (r as any).timestamp ?? (r as any).published_at;
+      const data = rows
+        .map((r): CandlestickData | null => {
+          const ts = extractChartTime(r, spec.base_feed?.time_field_name);
+          if (!ts) return null;
           return {
-            time: Math.floor(new Date(ts as string).getTime() / 1000) as UTCTimestamp,
+            time: ts,
             open: Number((r as any).open),
             high: Number((r as any).high),
             low: Number((r as any).low),
             close: Number((r as any).close),
           };
         })
-        .filter((d) => Number.isFinite(d.open) && Number.isFinite(d.close))
+        .filter((d): d is CandlestickData => d != null && Number.isFinite(d.open) && Number.isFinite(d.close))
         .sort((a, b) => (a.time as number) - (b.time as number));
       baseSeriesRef.current.setData(data);
     } else if (baseSeriesRef.current) {
       try { chart.removeSeries(baseSeriesRef.current); } catch { /* ignore */ }
       baseSeriesRef.current = null;
     }
-  }, [spec.chart_type, spec.base_feed?.target_id, spec.base_feed?.event_name, rawEvents]);
+  }, [spec.chart_type, spec.base_feed?.target_id, spec.base_feed?.event_name, spec.base_feed?.time_field_name, rawEvents]);
 
   // Render line bindings.
   useEffect(() => {
@@ -568,14 +650,15 @@ function ChartPanel({
           const key = `${slot.target_id}:${slot.event_name || 'trade'}`;
           const rows = rawEvents.get(key) ?? [];
           const field = String(slot.field_name ?? binding.param_values.field ?? '');
+          const timeField = String(slot.time_field_name ?? binding.param_values.time_field ?? '');
           data = rows
             .map((r) => {
-              const ts = (r as any).timestamp ?? (r as any).published_at;
+              const ts = extractChartTime(r, timeField);
               const payload = ((r as any).__payload ?? r) as Record<string, unknown>;
               const value = extractScalar(payload, field);
               if (value == null || !ts) return null;
               return {
-                time: Math.floor(new Date(ts as string).getTime() / 1000) as UTCTimestamp,
+                time: ts,
                 value,
               } as LineData;
             })
@@ -729,9 +812,9 @@ function PanelInspector({
       indicator_ref: 'builtin.raw',
       instance_id: '',
       input_bindings: [
-        { slot_name: 'source', target_id: '', event_name: '', field_name: '' },
+        { slot_name: 'source', target_id: '', event_name: '', time_field_name: '', field_name: '' },
       ],
-      param_values: { field: '' },
+      param_values: { field: '', time_field: '' },
       output_name: 'value',
       axis: 'left',
       color: '',
@@ -742,13 +825,23 @@ function PanelInspector({
   }
 
   function setBaseFeed(patch: Partial<ChartPanelBaseFeed>) {
-    const cur = panel.base_feed ?? { target_id: '', event_name: 'ohlcv' };
-    commit({ ...panel, base_feed: { ...cur, ...patch } });
+    const cur = panel.base_feed ?? { target_id: '', event_name: 'ohlcv', time_field_name: '' };
+    const next = { ...cur, ...patch };
+    if ('target_id' in patch && !patch.target_id) {
+      next.event_name = '';
+      next.time_field_name = '';
+    } else if ('target_id' in patch || 'event_name' in patch) {
+      next.time_field_name = '';
+    }
+    commit({ ...panel, base_feed: next });
   }
 
   function getDeclaration(ref: string): IndicatorDeclaration | null {
     return indicators.find((i) => i.script_id === ref)?.declaration ?? null;
   }
+
+  const baseTarget = targets.find((t) => t.target_id === (panel.base_feed?.target_id ?? ''));
+  const baseTimeRes = computeAllowedTimeFields(panel.base_feed?.event_name ?? '', baseTarget, rawEvents);
 
   return (
     <div className="charts-inspector">
@@ -801,10 +894,27 @@ function PanelInspector({
           <label className="field">
             <span>Event</span>
             <select
-              value={panel.base_feed?.event_name ?? 'ohlcv'}
+              value={baseTarget ? (panel.base_feed?.event_name ?? 'ohlcv') : ''}
               onChange={(e) => setBaseFeed({ event_name: e.target.value })}
+              disabled={!baseTarget}
             >
-              <option value="ohlcv">ohlcv</option>
+              {!baseTarget && <option value="">— select target first —</option>}
+              {baseTarget && <option value="ohlcv">ohlcv</option>}
+            </select>
+          </label>
+          <label className="field">
+            <span>x/time field <small className="hint-inline">({baseTimeRes.layer})</small></span>
+            <select
+              value={baseTimeRes.fields.includes(panel.base_feed?.time_field_name ?? '') ? panel.base_feed?.time_field_name ?? '' : ''}
+              onChange={(e) => setBaseFeed({ time_field_name: e.target.value })}
+              disabled={!baseTarget || !(panel.base_feed?.event_name) || baseTimeRes.fields.length === 0}
+            >
+              {!baseTimeRes.fields.includes(panel.base_feed?.time_field_name ?? '') && (
+                <option value="">{baseTarget && panel.base_feed?.event_name ? '— x/time field —' : '— select target/event first —'}</option>
+              )}
+              {baseTimeRes.fields.map((h) => (
+                <option key={h} value={h}>{h}</option>
+              ))}
             </select>
           </label>
         </div>
@@ -847,6 +957,7 @@ function PanelInspector({
                       slot_name: inp.slot_name,
                       target_id: '',
                       event_name: '',
+                      time_field_name: '',
                       field_name: '',
                     }));
                     updateBinding(idx, {
@@ -876,6 +987,7 @@ function PanelInspector({
                       slot_name: inp.slot_name,
                       target_id: '',
                       event_name: '',
+                      time_field_name: '',
                       field_name: '',
                     };
                     const slotTarget = targets.find((t) => t.target_id === slot.target_id);
@@ -888,6 +1000,7 @@ function PanelInspector({
                       canonicalSchemas,
                       rawEvents,
                     );
+                    const timeFieldRes = computeAllowedTimeFields(slot.event_name, slotTarget, rawEvents);
                     function patchSlot(patch: Partial<ChartInputBinding>) {
                       const next = { ...slot, ...patch };
                       // Cascade: target change → re-evaluate event; event change
@@ -897,12 +1010,21 @@ function PanelInspector({
                       const newAllowedEvents = computeAllowedEvents(inp.event_names, newTarget, newCap);
                       if (!newTarget) {
                         next.event_name = '';
+                        next.time_field_name = '';
                         next.field_name = '';
                       } else if (!next.event_name || !newAllowedEvents.includes(next.event_name)) {
                         next.event_name = newAllowedEvents[0] ?? '';
+                        next.time_field_name = '';
                         next.field_name = '';
                       } else if ('event_name' in patch) {
+                        next.time_field_name = '';
                         next.field_name = '';
+                      }
+                      const newTimeFieldRes = computeAllowedTimeFields(next.event_name, newTarget, rawEvents);
+                      if (!next.time_field_name && newTimeFieldRes.fields.length > 0 && ('event_name' in patch || 'target_id' in patch)) {
+                        next.time_field_name = newTimeFieldRes.fields[0] ?? '';
+                      } else if (next.time_field_name && !newTimeFieldRes.fields.includes(next.time_field_name)) {
+                        next.time_field_name = newTimeFieldRes.fields[0] ?? '';
                       }
                       const newFieldRes = computeAllowedFields(
                         next.event_name,
@@ -956,8 +1078,23 @@ function PanelInspector({
                             ))}
                           </select>
                         </label>
-                        <label className="field" style={{ gridColumn: '1 / span 2' }}>
-                          <span>field <small className="hint-inline">({fieldRes.layer})</small></span>
+                        <label className="field">
+                          <span>x/time field <small className="hint-inline">({timeFieldRes.layer})</small></span>
+                          <select
+                            value={timeFieldRes.fields.includes(slot.time_field_name) ? slot.time_field_name : ''}
+                            onChange={(e) => patchSlot({ time_field_name: e.target.value })}
+                            disabled={!slotTarget || !slot.event_name || timeFieldRes.fields.length === 0}
+                          >
+                            {!timeFieldRes.fields.includes(slot.time_field_name) && (
+                              <option value="">{slotTarget && slot.event_name ? '— x/time field —' : '— select target/event first —'}</option>
+                            )}
+                            {timeFieldRes.fields.map((h) => (
+                              <option key={h} value={h}>{h}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="field">
+                          <span>y/value field <small className="hint-inline">({fieldRes.layer})</small></span>
                           <select
                             value={fieldRes.fields.includes(slot.field_name) ? slot.field_name : ''}
                             onChange={(e) => patchSlot({ field_name: e.target.value })}
@@ -1287,6 +1424,7 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
           event_name: eventName,
           timestamp: envelope.timestamp,
           published_at: envelope.published_at,
+          occurred_at: (envelope.payload as any)?.occurred_at,
         } as Record<string, unknown>;
         setRawEvents((prev) => {
           const next = new Map(prev);
@@ -1402,7 +1540,7 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
             symbol: sym,
             x: 0, y: 0, w: 12, h: 14,
             title: `${sym} Candle`,
-            base_feed: { target_id: tgt.target_id, event_name: 'ohlcv' },
+            base_feed: { target_id: tgt.target_id, event_name: 'ohlcv', time_field_name: 'timestamp' },
             series_bindings: [],
           }),
         });
@@ -1420,9 +1558,9 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
                 binding_id: uid('bind'),
                 indicator_ref: 'builtin.raw',
                 input_bindings: [
-                  { slot_name: 'source', target_id: tgt.target_id, event_name: 'trade', field_name: 'price' },
+                  { slot_name: 'source', target_id: tgt.target_id, event_name: 'trade', time_field_name: 'timestamp', field_name: 'price' },
                 ],
-                param_values: [['field', 'price']],
+                param_values: [['field', 'price'], ['time_field', 'timestamp']],
                 output_name: 'value',
                 axis: 'left',
                 color: '',
@@ -1466,7 +1604,7 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
         series_bindings: [],
       };
       if (chartType === 'candle' && tgt) {
-        body.base_feed = { target_id: tgt.target_id, event_name: 'ohlcv' };
+        body.base_feed = { target_id: tgt.target_id, event_name: 'ohlcv', time_field_name: '' };
       }
       const resp = await apiJson<{ panel: any }>('/api/admin/charts/panels', {
         method: 'PUT',

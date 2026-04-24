@@ -242,6 +242,22 @@ class RawPassthroughTests(unittest.TestCase):
         self.assertEqual(out.value, 123.45)
         self.assertEqual(out.meta["field"], "raw.info.lastPrice")
 
+    def test_raw_passthrough_uses_dotted_time_field(self) -> None:
+        from src.indicator_runtime import RawPassthroughIndicator
+
+        ind = RawPassthroughIndicator(field="raw.info.lastPrice", time_field="raw.info.T")
+        out = ind.on_event({
+            "event_type": "trade",
+            "symbol": "BTC/USDT",
+            "market_scope": "",
+            "payload": {"raw": {"info": {"lastPrice": "123.45", "T": 1777000000000}}},
+            "published_at": "2026-04-21T12:00:00+00:00",
+        })
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertEqual(out.timestamp, "1777000000000")
+        self.assertEqual(out.meta["time_field"], "raw.info.T")
+
 
 if __name__ == "__main__":
     unittest.main()

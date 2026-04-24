@@ -66,16 +66,16 @@ class ChartPanelIndicatorFirstContractTests(unittest.TestCase):
             panel_id="p1",
             chart_type="candle",
             symbol="BTCUSDT",
-            base_feed=ChartPanelBaseFeed(target_id="t-btc", event_name="ohlcv"),
+            base_feed=ChartPanelBaseFeed(target_id="t-btc", event_name="ohlcv", time_field_name="timestamp"),
             series_bindings=(
                 ChartSeriesBinding(
                     binding_id="b1",
                     indicator_ref="builtin.raw",
                     input_bindings=(
                         ChartInputSlot(slot_name="source", target_id="t-btc",
-                                       event_name="trade", field_name="price"),
+                                       event_name="trade", time_field_name="raw.info.T", field_name="price"),
                     ),
-                    param_values=(("field", "price"),),
+                    param_values=(("field", "price"), ("time_field", "raw.info.T")),
                     output_name="value",
                     axis="right",
                     color="#ffb000",
@@ -85,14 +85,18 @@ class ChartPanelIndicatorFirstContractTests(unittest.TestCase):
         )
         roundtripped = json.loads(json.dumps(dataclasses.asdict(spec)))
         self.assertEqual(roundtripped["base_feed"]["target_id"], "t-btc")
+        self.assertEqual(roundtripped["base_feed"]["time_field_name"], "timestamp")
         b = roundtripped["series_bindings"][0]
         self.assertEqual(b["indicator_ref"], "builtin.raw")
         self.assertEqual(b["output_name"], "value")
         self.assertEqual(b["input_bindings"][0]["slot_name"], "source")
         self.assertEqual(b["input_bindings"][0]["field_name"], "price")
+        self.assertEqual(b["input_bindings"][0]["time_field_name"], "raw.info.T")
         # param_values serialise as list-of-pairs.
         self.assertEqual(b["param_values"][0][0], "field")
         self.assertEqual(b["param_values"][0][1], "price")
+        self.assertEqual(b["param_values"][1][0], "time_field")
+        self.assertEqual(b["param_values"][1][1], "raw.info.T")
 
 
 if __name__ == "__main__":

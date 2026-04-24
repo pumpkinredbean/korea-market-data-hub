@@ -41,16 +41,16 @@ class ChartsStateRoundTripTests(unittest.IsolatedAsyncioTestCase):
                 w=12,
                 h=14,
                 title="cn",
-                base_feed=ChartPanelBaseFeed(target_id="t-btc", event_name="ohlcv"),
+                base_feed=ChartPanelBaseFeed(target_id="t-btc", event_name="ohlcv", time_field_name="raw.timestamp"),
                 series_bindings=(
                     ChartSeriesBinding(
                         binding_id="b-mark",
                         indicator_ref="builtin.raw",
                         input_bindings=(
                             ChartInputSlot(slot_name="source", target_id="t-btc",
-                                           event_name="mark_price", field_name="value"),
+                                           event_name="mark_price", time_field_name="raw.datetime", field_name="value"),
                         ),
-                        param_values=(("field", "value"),),
+                        param_values=(("field", "value"), ("time_field", "raw.datetime")),
                         output_name="value",
                         axis="right",
                         label="mark",
@@ -68,13 +68,15 @@ class ChartsStateRoundTripTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reloaded.panel_id, "p-multi")
             self.assertIsNotNone(reloaded.base_feed)
             self.assertEqual(reloaded.base_feed.target_id, "t-btc")  # type: ignore[union-attr]
+            self.assertEqual(reloaded.base_feed.time_field_name, "raw.timestamp")  # type: ignore[union-attr]
             self.assertEqual(len(reloaded.series_bindings), 1)
             b = reloaded.series_bindings[0]
             self.assertEqual(b.indicator_ref, "builtin.raw")
             self.assertEqual(b.output_name, "value")
             self.assertEqual(b.input_bindings[0].slot_name, "source")
             self.assertEqual(b.input_bindings[0].field_name, "value")
-            self.assertEqual(dict(b.param_values), {"field": "value"})
+            self.assertEqual(b.input_bindings[0].time_field_name, "raw.datetime")
+            self.assertEqual(dict(b.param_values), {"field": "value", "time_field": "raw.datetime"})
             # Panel-scoped script propagated into the global script registry on upsert.
             scripts = {s.script_id: s for s in await store2.list_scripts()}
             self.assertIn("panel-s1", scripts)
@@ -101,6 +103,7 @@ class ChartsStateRoundTripTests(unittest.IsolatedAsyncioTestCase):
                                 "target_id": "tgt-1",
                                 "symbol": "005930",
                                 "event_name": "trade",
+                                "time_field_name": "raw.info.T",
                                 "field_name": "price",
                                 "axis": "left",
                                 "color": "",
@@ -124,8 +127,9 @@ class ChartsStateRoundTripTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(b.input_bindings[0].slot_name, "source")
             self.assertEqual(b.input_bindings[0].target_id, "tgt-1")
             self.assertEqual(b.input_bindings[0].event_name, "trade")
+            self.assertEqual(b.input_bindings[0].time_field_name, "raw.info.T")
             self.assertEqual(b.input_bindings[0].field_name, "price")
-            self.assertEqual(dict(b.param_values), {"field": "price"})
+            self.assertEqual(dict(b.param_values), {"field": "price", "time_field": "raw.info.T"})
 
     async def test_legacy_source_kind_builtin_is_migrated(self) -> None:
         from src.indicator_runtime import ChartsStateStore
