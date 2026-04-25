@@ -139,12 +139,19 @@ interface IndicatorOutputEnvelope {
   point: SeriesPoint;
 }
 
+interface AdminRecentEventRow {
+  event_name?: string;
+  symbol?: string;
+  published_at?: string | null;
+  matched_target_ids?: string[];
+  payload?: Record<string, unknown> | null;
+}
+
 // ─── LocalStorage keys ───────────────────────────────────────────────────
 
 const LS_PREFIX = 'korea-market-data-hub.admin-charts';
 const LS_PREFERRED = `${LS_PREFIX}.preferredLayout.v4`;
 const LS_WORKING = `${LS_PREFIX}.workingLayout.v4`;
-const LS_SEED_DONE = `${LS_PREFIX}.seed.v4.done`;
 
 const DEFAULT_LAYOUT: Layout[] = [];
 const CHART_LAYOUT_COLS = 12;
@@ -290,10 +297,17 @@ function normalizePanel(raw: any): ChartPanelSpec {
 function panelToWire(panel: ChartPanelSpec): unknown {
   return {
     ...panel,
-    base_feed: panel.base_feed ?? undefined,
+    base_feed: panel.base_feed
+      ? { ...panel.base_feed, time_field_name: bindingText(panel.base_feed.time_field_name) }
+      : undefined,
     series_bindings: panel.series_bindings.map((b) => ({
       ...b,
-      param_values: paramValuesToTuples(b.param_values),
+      input_bindings: b.input_bindings.map((s) => ({
+        ...s,
+        time_field_name: bindingText(s.time_field_name),
+        field_name: bindingText(s.field_name),
+      })),
+      param_values: paramValuesToTuples(sanitizeParamValues(b.param_values)),
     })),
   };
 }
@@ -366,9 +380,15 @@ function uniqueOrdered(values: string[]): string[] {
   return out;
 }
 
-function withCurrentCandidate(fields: string[], current: string): string[] {
-  if (!current || current.startsWith('normalized.')) return fields;
-  return uniqueOrdered([...fields, current]);
+function selectedFieldValue(fields: string[], current: string): string {
+  if (!current || current.startsWith('normalized.')) return '';
+  return fields.includes(current) ? current : '';
+}
+
+function sampleOptionLabel(hasTarget: boolean, hasEvent: boolean, optionCount: number, kind: 'time' | 'value'): string {
+  if (!hasTarget || !hasEvent) return '— select target/event first —';
+  if (optionCount > 0) return kind === 'time' ? '— x/time field —' : '— y/value field —';
+  return '— sample unavailable —';
 }
 
 function preferRawPaths(fields: string[]): string[] {
@@ -391,7 +411,7 @@ function isFieldParamHidden(binding: ChartSeriesBinding, paramName: string): boo
   return binding.indicator_ref === 'builtin.raw' && (paramName === 'field' || paramName === 'time_field');
 }
 
-// ─── Selector helpers (target-aware events + schema-aware fields) ────────
+// ─── Selector helpers (target-aware events + observed raw sample fields) ──
 
 export interface TargetCapabilityRef {
   provider: string;
@@ -440,34 +460,39 @@ export function computeAllowedEvents(
   return slot.filter((e) => capSet.has(e) && (enabledSet.size === 0 || enabledSet.has(e)));
 }
 
-/** Sample observed field names from any raw events seen for this target+event. */
+export type FieldOptionLayer = 'sampled' | 'empty';
+
+export function rawSampleKey(targetId: string, eventName: string): string {
+  return `${targetId}:${eventName}`;
+}
+
+export function rawRowsForTargetEvent(
+  target: TargetRef | undefined,
+  eventName: string,
+  rawEvents: Map<string, Array<Record<string, unknown>>>,
+): Array<Record<string, unknown>> {
+  if (!target || !eventName) return [];
+  return rawEvents.get(rawSampleKey(target.target_id, eventName)) ?? [];
+}
+
+/** Sample observed field names from raw events seen for this target+event. */
 export function sampledPayloadFields(
   target: TargetRef | undefined,
   eventName: string,
   rawEvents: Map<string, Array<Record<string, unknown>>>,
 ): string[] {
-  if (!target || !eventName) return [];
-  const candidateKeys = [
-    `${target.target_id}:${eventName}`,
-    `${target.instrument.symbol}:${eventName}`,
-  ];
   const out = new Set<string>();
   const internal = new Set([
     '__payload', 'symbol', 'event_name', 'timestamp', 'published_at', 'occurred_at',
   ]);
-  for (const key of candidateKeys) {
-    const rows = rawEvents.get(key);
-    if (!rows || rows.length === 0) continue;
-      // Sample most recent few rows.
-      for (const row of rows.slice(-5)) {
-        const payload = ((row as any).__payload ?? row) as Record<string, unknown>;
-        for (const path of scalarDottedPaths(payload)) {
-          const top = path.split('.')[0];
-          if (internal.has(top)) continue;
-          if (top === 'normalized') continue;
-          out.add(path);
-        }
-      }
+  for (const row of rawRowsForTargetEvent(target, eventName, rawEvents).slice(-5)) {
+    const payload = ((row as any).__payload ?? row) as Record<string, unknown>;
+    for (const path of scalarDottedPaths(payload)) {
+      const top = path.split('.')[0];
+      if (internal.has(top)) continue;
+      if (top === 'normalized') continue;
+      out.add(path);
+    }
   }
   return Array.from(out);
 }
@@ -491,16 +516,10 @@ export function sampledTimeFields(
   eventName: string,
   rawEvents: Map<string, Array<Record<string, unknown>>>,
 ): string[] {
-  if (!target || !eventName) return [];
-  const candidateKeys = [`${target.target_id}:${eventName}`, `${target.instrument.symbol}:${eventName}`];
   const out = new Set<string>();
-  for (const key of candidateKeys) {
-    const rows = rawEvents.get(key);
-    if (!rows || rows.length === 0) continue;
-    for (const row of rows.slice(-5)) {
-      for (const path of scalarDottedPaths(((row as any).__payload ?? row) as Record<string, unknown>)) {
-        if (isTimeLikePath(path)) out.add(path);
-      }
+  for (const row of rawRowsForTargetEvent(target, eventName, rawEvents).slice(-5)) {
+    for (const path of scalarDottedPaths(((row as any).__payload ?? row) as Record<string, unknown>)) {
+      if (isTimeLikePath(path)) out.add(path);
     }
   }
   return Array.from(out);
@@ -510,7 +529,7 @@ export function computeAllowedTimeFields(
   eventName: string,
   target: TargetRef | undefined,
   rawEvents: Map<string, Array<Record<string, unknown>>>,
-): { fields: string[]; layer: 'sampled' | 'fallback' | 'empty' } {
+): { fields: string[]; layer: FieldOptionLayer } {
   if (!target || !eventName) return { fields: [], layer: 'empty' };
   const sampled = sampledTimeFields(target, eventName, rawEvents);
   if (sampled.length > 0) {
@@ -523,32 +542,20 @@ export function computeAllowedTimeFields(
       layer: 'sampled',
     };
   }
-  return { fields: ['published_at'], layer: 'fallback' };
+  return { fields: [], layer: 'empty' };
 }
 
-/** Compute the field options for a slot using the documented priority chain. */
+/** Compute y/value options from the actual raw sample only. */
 export function computeAllowedFields(
   eventName: string,
   target: TargetRef | undefined,
-  declHints: readonly string[],
-  canonicalSchemas: Record<string, string[]>,
   rawEvents: Map<string, Array<Record<string, unknown>>>,
-): { fields: string[]; layer: 'canonical' | 'runtime' | 'sampled' | 'hints' | 'empty' } {
+): { fields: string[]; layer: FieldOptionLayer } {
   if (!target || !eventName) return { fields: [], layer: 'empty' };
-  // (a) sampled payload fields: prefer observed runtime scalar paths,
-  // including nested CCXT raw-only fields such as raw.info.lastPrice.
+  // Sampled payload fields only: no canonical schema, declaration hints, or
+  // static fallback candidates may become selector source-of-truth.
   const sampled = preferRawPaths(sampledPayloadFields(target, eventName, rawEvents));
   if (sampled.length > 0) return { fields: sampled, layer: 'sampled' };
-  // (b) canonical/contracts schema fallback
-  const canonical = canonicalSchemas[eventName];
-  if (canonical && canonical.length > 0) return { fields: [...canonical], layer: 'canonical' };
-  // (b) runtime/indicator declaration: the IndicatorInputDecl ships
-  //     event_names + field_hints together, so when canonical is silent
-  //     we treat the declaration's hints as the runtime-decl layer.
-  //     (Distinguished from layer (d) only by event match: declHints
-  //     is provided per-slot already.)
-  // (d) declaration field_hints fallback
-  if (declHints && declHints.length > 0) return { fields: [...declHints], layer: 'hints' };
   return { fields: [], layer: 'empty' };
 }
 
@@ -808,7 +815,6 @@ function PanelInspector({
   targets,
   indicators,
   capabilities,
-  canonicalSchemas,
   rawEvents,
   onChange,
   onDelete,
@@ -816,10 +822,9 @@ function PanelInspector({
   onSavePanelScript,
 }: {
   panel: ChartPanelSpec;
-  targets: Array<{ target_id: string; instrument: { symbol: string; instrument_type?: string | null; venue?: string | null }; provider?: string | null }>;
+  targets: TargetRef[];
   indicators: IndicatorCatalogEntry[];
   capabilities: TargetCapabilityRef[];
-  canonicalSchemas: Record<string, string[]>;
   rawEvents: Map<string, Array<Record<string, unknown>>>;
   onChange: (next: ChartPanelSpec) => void;
   onDelete: () => void;
@@ -880,7 +885,7 @@ function PanelInspector({
 
   const baseTarget = targets.find((t) => t.target_id === (panel.base_feed?.target_id ?? ''));
   const baseTimeRes = computeAllowedTimeFields(panel.base_feed?.event_name ?? '', baseTarget, rawEvents);
-  const baseTimeFields = withCurrentCandidate(baseTimeRes.fields, panel.base_feed?.time_field_name ?? '');
+  const baseTimeFields = baseTimeRes.fields;
 
   return (
     <div className="charts-inspector">
@@ -944,12 +949,12 @@ function PanelInspector({
           <label className="field">
             <span>x/time field <small className="hint-inline">({baseTimeRes.layer})</small></span>
             <select
-              value={baseTimeFields.includes(panel.base_feed?.time_field_name ?? '') ? panel.base_feed?.time_field_name ?? '' : ''}
+              value={selectedFieldValue(baseTimeFields, panel.base_feed?.time_field_name ?? '')}
               onChange={(e) => setBaseFeed({ time_field_name: e.target.value })}
               disabled={!baseTarget || !(panel.base_feed?.event_name) || baseTimeFields.length === 0}
             >
-              {!baseTimeFields.includes(panel.base_feed?.time_field_name ?? '') && (
-                <option value="">{baseTarget && panel.base_feed?.event_name ? '— x/time field —' : '— select target/event first —'}</option>
+              {selectedFieldValue(baseTimeFields, panel.base_feed?.time_field_name ?? '') === '' && (
+                <option value="">{sampleOptionLabel(Boolean(baseTarget), Boolean(panel.base_feed?.event_name), baseTimeFields.length, 'time')}</option>
               )}
               {baseTimeFields.map((h) => (
                 <option key={h} value={h}>{h}</option>
@@ -1035,13 +1040,11 @@ function PanelInspector({
                     const fieldRes = computeAllowedFields(
                       slot.event_name,
                       slotTarget,
-                      inp.field_hints,
-                      canonicalSchemas,
                       rawEvents,
                     );
                     const timeFieldRes = computeAllowedTimeFields(slot.event_name, slotTarget, rawEvents);
-                    const timeFields = withCurrentCandidate(timeFieldRes.fields, slot.time_field_name);
-                    const valueFields = withCurrentCandidate(fieldRes.fields, slot.field_name);
+                    const timeFields = timeFieldRes.fields;
+                    const valueFields = fieldRes.fields;
                     function patchSlot(patch: Partial<ChartInputBinding>) {
                       const next = { ...slot, ...patch };
                       // Cascade: target change → re-evaluate event; event change
@@ -1053,8 +1056,8 @@ function PanelInspector({
                         next.event_name = '';
                         next.time_field_name = '';
                         next.field_name = '';
-                      } else if (!next.event_name || !newAllowedEvents.includes(next.event_name)) {
-                        next.event_name = newAllowedEvents[0] ?? '';
+                      } else if ('target_id' in patch || !next.event_name || !newAllowedEvents.includes(next.event_name)) {
+                        next.event_name = '';
                         next.time_field_name = '';
                         next.field_name = '';
                       } else if ('event_name' in patch) {
@@ -1062,24 +1065,16 @@ function PanelInspector({
                         next.field_name = '';
                       }
                       const newTimeFieldRes = computeAllowedTimeFields(next.event_name, newTarget, rawEvents);
-                      if (!next.time_field_name && newTimeFieldRes.fields.length > 0 && ('event_name' in patch || 'target_id' in patch)) {
-                        next.time_field_name = newTimeFieldRes.fields[0] ?? '';
-                      } else if (next.time_field_name && !newTimeFieldRes.fields.includes(next.time_field_name)) {
-                        next.time_field_name = newTimeFieldRes.fields[0] ?? '';
+                      if (next.time_field_name && !newTimeFieldRes.fields.includes(next.time_field_name)) {
+                        next.time_field_name = '';
                       }
                       const newFieldRes = computeAllowedFields(
                         next.event_name,
                         newTarget,
-                        inp.field_hints,
-                        canonicalSchemas,
                         rawEvents,
                       );
-                      if (!next.field_name && newFieldRes.fields.length > 0 && ('event_name' in patch || 'target_id' in patch)) {
-                        next.field_name = newFieldRes.fields[0] ?? '';
-                      } else if (next.field_name && !newFieldRes.fields.includes(next.field_name)) {
-                        // Stale field: pick first canonical/runtime/sampled candidate
-                        // rather than holding a value the new event cannot supply.
-                        next.field_name = newFieldRes.fields[0] ?? '';
+                      if (next.field_name && !newFieldRes.fields.includes(next.field_name)) {
+                        next.field_name = '';
                       }
                       const others = binding.input_bindings.filter((s) => s.slot_name !== inp.slot_name);
                       const input_bindings = [...others, next];
@@ -1122,12 +1117,12 @@ function PanelInspector({
                         <label className="field">
                           <span>x/time field <small className="hint-inline">({timeFieldRes.layer})</small></span>
                           <select
-                            value={timeFields.includes(slot.time_field_name) ? slot.time_field_name : ''}
+                            value={selectedFieldValue(timeFields, slot.time_field_name)}
                             onChange={(e) => patchSlot({ time_field_name: e.target.value })}
                             disabled={!slotTarget || !slot.event_name || timeFields.length === 0}
                           >
-                            {!timeFields.includes(slot.time_field_name) && (
-                              <option value="">{slotTarget && slot.event_name ? '— x/time field —' : '— select target/event first —'}</option>
+                            {selectedFieldValue(timeFields, slot.time_field_name) === '' && (
+                              <option value="">{sampleOptionLabel(Boolean(slotTarget), Boolean(slot.event_name), timeFields.length, 'time')}</option>
                             )}
                             {timeFields.map((h) => (
                               <option key={h} value={h}>{h}</option>
@@ -1137,12 +1132,12 @@ function PanelInspector({
                         <label className="field">
                           <span>y/value field <small className="hint-inline">({fieldRes.layer})</small></span>
                           <select
-                            value={valueFields.includes(slot.field_name) ? slot.field_name : ''}
+                            value={selectedFieldValue(valueFields, slot.field_name)}
                             onChange={(e) => patchSlot({ field_name: e.target.value })}
                             disabled={!slotTarget || !slot.event_name || valueFields.length === 0}
                           >
-                            {!valueFields.includes(slot.field_name) && (
-                              <option value="">{slotTarget && slot.event_name ? '— field —' : '— select target/event first —'}</option>
+                            {selectedFieldValue(valueFields, slot.field_name) === '' && (
+                              <option value="">{sampleOptionLabel(Boolean(slotTarget), Boolean(slot.event_name), valueFields.length, 'value')}</option>
                             )}
                             {valueFields.map((h) => (
                               <option key={h} value={h}>{h}</option>
@@ -1354,7 +1349,6 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
   const [banner, setBanner] = useState('');
   const [bannerError, setBannerError] = useState(false);
   const [selectedPanelId, setSelectedPanelId] = useState<string | null>(null);
-  const [canonicalSchemas, setCanonicalSchemas] = useState<Record<string, string[]>>({});
 
   const [layout, setLayout] = useState<Layout[]>(
     () => clampChartLayout(loadLayout(LS_WORKING) ?? loadLayout(LS_PREFERRED) ?? DEFAULT_LAYOUT),
@@ -1365,7 +1359,6 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
 
   const panelsRef = useRef<ChartPanelSpec[]>(panels);
   const targetsRef = useRef<TargetRef[]>(targets);
-  const seedAttemptedRef = useRef(false);
 
   useEffect(() => { panelsRef.current = panels; }, [panels]);
   useEffect(() => { targetsRef.current = targets; }, [targets]);
@@ -1394,17 +1387,53 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
     void onRefresh?.();
   }, [onRefresh]);
 
-  // Canonical event-field schema (priority layer (a) for the field selector).
+  function ingestRawEventRow(
+    prev: Map<string, Array<Record<string, unknown>>>,
+    eventName: string,
+    targetIds: string[],
+    row: Record<string, unknown>,
+  ): Map<string, Array<Record<string, unknown>>> {
+    if (!eventName || targetIds.length === 0) return prev;
+    const next = new Map(prev);
+    for (const targetId of targetIds) {
+      if (!targetId) continue;
+      const key = rawSampleKey(targetId, eventName);
+      const cur = next.get(key) ?? [];
+      next.set(key, [...cur, row].slice(-500));
+    }
+    return next;
+  }
+
+  // Initial raw sample catalog from recent runtime events, keyed by target_id:event_name.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const resp = await apiJson<{ schemas: Record<string, string[]> }>(
-          '/api/admin/charts/event-schemas',
+        const resp = await apiJson<{ recent_events?: AdminRecentEventRow[] }>(
+          '/api/admin/events?limit=200',
         );
-        if (!cancelled) setCanonicalSchemas(resp.schemas ?? {});
+        if (cancelled) return;
+        setRawEvents((prev) => {
+          let next = prev;
+          for (const ev of resp.recent_events ?? []) {
+            const eventName = String(ev.event_name ?? '');
+            if (!eventName) continue;
+            const payload = ev.payload ?? {};
+            const row = {
+              ...payload,
+              __payload: payload,
+              symbol: ev.symbol,
+              event_name: eventName,
+              timestamp: (payload as any).occurred_at ?? (payload as any).timestamp ?? ev.published_at,
+              published_at: ev.published_at,
+              occurred_at: (payload as any).occurred_at,
+            } as Record<string, unknown>;
+            next = ingestRawEventRow(next, eventName, ev.matched_target_ids ?? [], row);
+          }
+          return next;
+        });
       } catch {
-        /* leave empty; downstream falls through to runtime/sampled/hints */
+        /* raw samples remain unavailable until SSE arrives */
       }
     })();
     return () => { cancelled = true; };
@@ -1456,8 +1485,6 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
         const symbol = envelope.symbol;
         const eventName = envelope.event_name;
         if (!symbol || !eventName) return;
-        // Index by symbol+event so legacy lookups work; ChartPanel uses target_id.
-        // We index by both target_id (when panel uses one) and symbol fallback.
         const row = {
           ...(envelope.payload ?? {}),
           __payload: envelope.payload ?? {},
@@ -1468,63 +1495,18 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
           occurred_at: (envelope.payload as any)?.occurred_at,
         } as Record<string, unknown>;
         setRawEvents((prev) => {
-          const next = new Map(prev);
-          const symKey = `${symbol}:${eventName}`;
-          const cur = next.get(symKey) ?? [];
-          const updatedRows = [...cur, row].slice(-500);
-          next.set(symKey, updatedRows);
-          for (const tgtKey of rawEventMirrorKeysForPanels(
+          const targetKeys = rawEventMirrorKeysForPanels(
             symbol,
             eventName,
             panelsRef.current,
             targetsRef.current,
-          )) {
-            next.set(tgtKey, updatedRows);
-          }
-          return next;
+          ).map((key) => key.split(':')[0]);
+          return ingestRawEventRow(prev, eventName, targetKeys, row);
         });
       } catch { /* ignore */ }
     });
     return () => es.close();
   }, []);
-
-  // Backfill target-keyed mirrors when panels/targets change after symbol-keyed
-  // raw rows already exist. Live SSE updates refresh these mirrors inline above.
-  useEffect(() => {
-    setRawEvents((prev) => {
-      const next = new Map(prev);
-      let changed = false;
-      for (const panel of panels) {
-        for (const b of panel.series_bindings) {
-          for (const slot of b.input_bindings) {
-            if (!slot.target_id || !slot.event_name) continue;
-            const tgt = targets.find((t) => t.target_id === slot.target_id);
-            if (!tgt) continue;
-            const symKey = `${tgt.instrument.symbol}:${slot.event_name}`;
-            const tgtKey = `${slot.target_id}:${slot.event_name}`;
-            const rows = next.get(symKey);
-            if (rows && next.get(tgtKey) !== rows) {
-              next.set(tgtKey, rows);
-              changed = true;
-            }
-          }
-        }
-        if (panel.base_feed?.target_id) {
-          const tgt = targets.find((t) => t.target_id === panel.base_feed!.target_id);
-          if (tgt) {
-            const symKey = `${tgt.instrument.symbol}:${panel.base_feed.event_name || 'ohlcv'}`;
-            const tgtKey = `${panel.base_feed.target_id}:${panel.base_feed.event_name || 'ohlcv'}`;
-            const rows = next.get(symKey);
-            if (rows && next.get(tgtKey) !== rows) {
-              next.set(tgtKey, rows);
-              changed = true;
-            }
-          }
-        }
-      }
-      return changed ? next : prev;
-    });
-  }, [panels, targets, rawEvents]);
 
   // Sync layout with panels.
   useEffect(() => {
@@ -1554,68 +1536,6 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
   useEffect(() => {
     saveLayout(LS_WORKING, clampChartLayout(layout));
   }, [layout]);
-
-  // First-run seeder (v3).
-  useEffect(() => {
-    if (seedAttemptedRef.current) return;
-    if (panels.length > 0) {
-      seedAttemptedRef.current = true;
-      return;
-    }
-    if (typeof localStorage !== 'undefined' && localStorage.getItem(LS_SEED_DONE)) {
-      seedAttemptedRef.current = true;
-      return;
-    }
-    if (targets.length === 0) return;
-    seedAttemptedRef.current = true;
-    const tgt = targets[0];
-    const sym = tgt.instrument.symbol;
-    void (async () => {
-      try {
-        // Panel 1: candle with base_feed.
-        await apiJson<{ panel: any }>('/api/admin/charts/panels', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chart_type: 'candle',
-            symbol: sym,
-            x: 0, y: 0, w: 12, h: 14,
-            title: `${sym} Candle`,
-            base_feed: { target_id: tgt.target_id, event_name: 'ohlcv', time_field_name: 'timestamp' },
-            series_bindings: [],
-          }),
-        });
-        // Panel 2: line with single raw passthrough binding.
-        await apiJson<{ panel: any }>('/api/admin/charts/panels', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chart_type: 'line',
-            symbol: sym,
-            x: 0, y: 14, w: 12, h: 14,
-            title: `${sym} Trades`,
-            series_bindings: [
-              {
-                binding_id: uid('bind'),
-                indicator_ref: 'builtin.raw',
-                input_bindings: [
-                  { slot_name: 'source', target_id: tgt.target_id, event_name: 'trade', time_field_name: 'timestamp', field_name: 'price' },
-                ],
-                param_values: [['field', 'price'], ['time_field', 'timestamp']],
-                output_name: 'value',
-                axis: 'left',
-                color: '',
-                label: 'trade.price',
-                visible: true,
-              },
-            ],
-          }),
-        });
-        try { localStorage.setItem(LS_SEED_DONE, '1'); } catch { /* ignore */ }
-        await refresh();
-      } catch { /* ignore */ }
-    })();
-  }, [panels.length, targets, refresh]);
 
   // ── actions ──
 
@@ -1784,7 +1704,6 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
               targets={targets}
               indicators={indicatorsByPanel.get(selectedPanel.panel_id) ?? globalIndicators}
               capabilities={capabilities}
-              canonicalSchemas={canonicalSchemas}
               rawEvents={rawEvents}
               onChange={onInspectorChange}
               onDelete={() => void removePanel(selectedPanel.panel_id)}

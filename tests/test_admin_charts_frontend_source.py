@@ -63,7 +63,6 @@ def test_layout_storage_is_v4_and_clamped_full_width() -> None:
 
     assert "preferredLayout.v4" in source
     assert "workingLayout.v4" in source
-    assert "seed.v4.done" in source
     assert "preferredLayout.v1" not in source
     assert "workingLayout.v1" not in source
     assert "seed.v3.done" not in source
@@ -96,9 +95,22 @@ def test_charts_grid_is_not_shrunk_by_inspector_column() -> None:
 def test_raw_event_target_mirror_updates_existing_keys() -> None:
     source = CHARTS_VIEW.read_text()
 
-    assert "const updatedRows = [...cur, row].slice(-500);" in source
-    assert "next.set(symKey, updatedRows);" in source
+    assert "rawSampleKey(targetId, eventName)" in source
+    assert "ingestRawEventRow(prev, eventName, targetKeys, row)" in source
     assert "rawEventMirrorKeysForPanels(" in source
-    assert "next.set(tgtKey, updatedRows);" in source
     assert "rawEvents.size" not in source
-    assert "next.get(tgtKey) !== rows" in source
+    assert "`${target.instrument.symbol}:${eventName}`" not in source
+
+
+def test_selectors_use_actual_target_event_samples_only() -> None:
+    source = CHARTS_VIEW.read_text()
+
+    helper_start = source.index("export function computeAllowedFields")
+    helper_end = source.index("export function rawEventMirrorKeysForPanels")
+    helper = source[helper_start:helper_end]
+    assert "canonicalSchemas" not in helper
+    assert "field_hints" not in helper
+    assert "return { fields: [], layer: 'empty' }" in helper
+    assert "sampleOptionLabel" in source
+    assert "— sample unavailable —" in source
+    assert "newAllowedEvents[0]" not in source
